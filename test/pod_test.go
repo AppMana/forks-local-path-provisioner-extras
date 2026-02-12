@@ -369,6 +369,11 @@ func (p *PodTestSuite) verifyCapacityExhaustion() {
 	}
 }
 
+func (p *PodTestSuite) TestQuotaOnUnsupportedFilesystem() {
+	p.kustomizeDir = "quota-unsupported-fs"
+	p.verifyProvisioningFailed("unsupported filesystem")
+}
+
 func (p *PodTestSuite) TestPathTraversalPrevention() {
 	testCases := []struct {
 		name          string

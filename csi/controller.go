@@ -32,12 +32,12 @@ func NewControllerServer(p *lpp.Provisioner) *ControllerServer {
 }
 
 func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
+	// Only advertise capabilities that are actually wired. EXPAND_VOLUME
+	// (M3), GET_CAPACITY (M2), CREATE_DELETE_SNAPSHOT/LIST_SNAPSHOTS (M7)
+	// are added as their milestones land. Sanity drops the corresponding
+	// test suites when a capability is not advertised.
 	caps := []csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
-		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
-		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 	}
 	out := make([]*csi.ControllerServiceCapability, 0, len(caps))
 	for _, c := range caps {
@@ -50,12 +50,20 @@ func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.
 	return &csi.ControllerGetCapabilitiesResponse{Capabilities: out}, nil
 }
 
-func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
 	if req.VolumeId == "" {
 		return nil, status.Error(codes.InvalidArgument, "VolumeId missing")
 	}
 	if len(req.VolumeCapabilities) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "VolumeCapabilities missing")
+	}
+	// Spec: ValidateVolumeCapabilities must NotFound if the volume does not
+	// exist. We treat the PV API object as ground truth.
+	if _, err := cs.provisioner.KubeClient().CoreV1().PersistentVolumes().Get(ctx, req.VolumeId, metav1.GetOptions{}); err != nil {
+		if k8serror.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound, "volume %s does not exist", req.VolumeId)
+		}
+		return nil, status.Errorf(codes.Internal, "PV lookup: %v", err)
 	}
 	for _, c := range req.VolumeCapabilities {
 		mode := c.GetAccessMode().GetMode()
@@ -93,6 +101,30 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if pvcName == "" || pvcNamespace == "" {
 		return nil, status.Error(codes.InvalidArgument,
 			"PVC metadata missing — csi-provisioner must run with --extra-create-metadata=true")
+	}
+
+	// Spec compliance: CreateVolume must be idempotent. If a PV with this
+	// name already exists, return its info (or AlreadyExists if capacity
+	// or parameters differ).
+	if existing, err := cs.provisioner.KubeClient().CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{}); err == nil {
+		if existing.Spec.PersistentVolumeSource.CSI == nil || existing.Spec.PersistentVolumeSource.CSI.Driver != DriverName {
+			return nil, status.Errorf(codes.AlreadyExists, "volume %s exists but is not owned by %s", pvName, DriverName)
+		}
+		existingBytes := existing.Spec.Capacity[v1.ResourceStorage]
+		if existingBytes.Value() != requestedBytes {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"volume %s already exists with capacity %d, cannot satisfy request for %d",
+				pvName, existingBytes.Value(), requestedBytes)
+		}
+		// Same name + same size → return the existing volume.
+		attrs := existing.Spec.PersistentVolumeSource.CSI.VolumeAttributes
+		return &csi.CreateVolumeResponse{Volume: &csi.Volume{
+			VolumeId:      pvName,
+			CapacityBytes: existingBytes.Value(),
+			VolumeContext: attrs,
+		}}, nil
+	} else if !k8serror.IsNotFound(err) {
+		return nil, status.Errorf(codes.Internal, "PV lookup: %v", err)
 	}
 
 	cfgName := req.Parameters["storageClassConfig"]

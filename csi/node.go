@@ -3,9 +3,7 @@ package csi
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/sirupsen/logrus"
@@ -28,6 +26,13 @@ func NewNodeServer(nodeID string) *NodeServer {
 		nodeID:  nodeID,
 		mounter: mount.New(""),
 	}
+}
+
+// SetMounter swaps the mount.Interface implementation. Tests use a
+// mount.NewFakeMounter() so bind-mount-flavored sanity specs run without
+// CAP_SYS_ADMIN.
+func (ns *NodeServer) SetMounter(m mount.Interface) {
+	ns.mounter = m
 }
 
 func (ns *NodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
@@ -171,19 +176,3 @@ func (ns *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolu
 func (ns *NodeServer) NodeExpandVolume(_ context.Context, _ *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "NodeExpandVolume not yet implemented (M3)")
 }
-
-// abs is a tiny helper so the caller doesn't need to import filepath.
-func abs(p string) string {
-	if filepath.IsAbs(p) {
-		return p
-	}
-	a, err := filepath.Abs(p)
-	if err != nil {
-		return p
-	}
-	return a
-}
-
-// errMissing is a small helper used by tests; keep here so the file is
-// self-contained when imported in unit tests.
-var errMissing = fmt.Errorf("missing")

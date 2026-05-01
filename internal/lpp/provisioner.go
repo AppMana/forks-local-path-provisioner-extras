@@ -47,7 +47,7 @@ var (
 // the configured nodePathMap.
 type Provisioner struct {
 	ctx                context.Context
-	kubeClient         *clientset.Clientset
+	kubeClient         clientset.Interface
 	namespace          string
 	helperImage        string
 	serviceAccountName string
@@ -59,6 +59,16 @@ type Provisioner struct {
 	configMutex     *sync.RWMutex
 	helperPod       *v1.Pod
 	capacityTracker *CapacityTracker
+
+	// runHelperPodFn is the helper-pod dispatch hook. nil means "use the
+	// real implementation". Tests inject a fake via SetRunHelperPodFn.
+	runHelperPodFn func(context.Context, HelperAction) error
+}
+
+// SetRunHelperPodFn replaces the helper-pod dispatch with a test fake.
+// Pass nil to restore the real behavior.
+func (p *Provisioner) SetRunHelperPodFn(fn func(context.Context, HelperAction) error) {
+	p.runHelperPodFn = fn
 }
 
 // NewProvisioner builds a Provisioner and runs an initial config refresh.
@@ -66,7 +76,7 @@ type Provisioner struct {
 // controller restarts.
 func NewProvisioner(
 	ctx context.Context,
-	kubeClient *clientset.Clientset,
+	kubeClient clientset.Interface,
 	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string,
 ) (*Provisioner, error) {
 	p := &Provisioner{
@@ -91,12 +101,16 @@ func NewProvisioner(
 	if err := p.initCapacityTracker(); err != nil {
 		logrus.Warnf("failed to initialize capacity tracker from existing PVs: %v", err)
 	}
-	p.watchAndRefreshConfig()
+	// Only spawn the watch loop when configFile is an actual path; inline
+	// JSON (used in tests and as a fallback) has nothing to refresh.
+	if isJSONFile(configFile) {
+		p.watchAndRefreshConfig()
+	}
 	return p, nil
 }
 
 // KubeClient returns the underlying Kubernetes clientset.
-func (p *Provisioner) KubeClient() *clientset.Clientset { return p.kubeClient }
+func (p *Provisioner) KubeClient() clientset.Interface { return p.kubeClient }
 
 // Namespace returns the namespace the provisioner runs helper pods into.
 func (p *Provisioner) Namespace() string { return p.namespace }
@@ -337,7 +351,15 @@ type HelperAction struct {
 
 // RunHelperPod creates a one-shot helper pod on the target node and waits for
 // it to complete. Pod logs are captured into the controller's log stream.
-func (p *Provisioner) RunHelperPod(ctx context.Context, a HelperAction) (err error) {
+// Tests can inject a fake via SetRunHelperPodFn.
+func (p *Provisioner) RunHelperPod(ctx context.Context, a HelperAction) error {
+	if p.runHelperPodFn != nil {
+		return p.runHelperPodFn(ctx, a)
+	}
+	return p.runHelperPodReal(ctx, a)
+}
+
+func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err error) {
 	defer func() {
 		err = errors.Wrapf(err, "failed to %v volume %v", a.Type, a.Volume.Name)
 	}()

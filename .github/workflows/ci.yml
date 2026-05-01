@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main, appmana-extras, "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit-tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go vet (e2e tags)
+        if: runner.os == 'Linux'
+        run: |
+          go vet -tags=e2e ./...
+          go vet -tags=quota_e2e ./...
+          go vet -tags=quota_ci_e2e ./...
+          go vet -tags=sanity ./...
+      - name: go test
+        run: go test -race -count=1 -timeout=120s ./csi/... ./internal/...
+      - name: go test (coverage)
+        if: runner.os == 'Linux'
+        run: |
+          go test -count=1 -timeout=120s \
+            -coverpkg=./csi/...,./internal/... \
+            -coverprofile=coverage.out \
+            ./csi/... ./internal/...
+          go tool cover -func=coverage.out | tee coverage.txt
+          {
+            echo "## Coverage";
+            echo '```';
+            cat coverage.txt;
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload coverage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+
+  sanity:
+    name: csi-sanity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: csi-sanity (-tags=sanity)
+        run: go test -tags=sanity -count=1 -timeout=300s -v ./csi/...
+
+  cross-build:
+    name: cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: linux,   goarch: arm }
+          - { goos: linux,   goarch: ppc64le }
+          - { goos: linux,   goarch: riscv64 }
+          - { goos: linux,   goarch: s390x }
+          - { goos: windows, goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -ldflags="-X main.VERSION=ci -s -w" -o /tmp/local-path-csi-${{ matrix.goos }}-${{ matrix.goarch }} .

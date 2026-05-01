@@ -58,3 +58,11 @@ COPY --from=validate /go/src/github.com/rancher/local-path-provisioner/bin/ /
 FROM scratch AS ci-artifacts
 COPY --from=validate /go/src/github.com/rancher/local-path-provisioner/bin/ /bin/
 COPY --from=validate /validate.done /validate.done
+
+# runtime is the image users actually deploy. Distroless base; the binary
+# selected matches the buildx TARGETARCH.
+FROM gcr.io/distroless/static:nonroot AS runtime
+ARG TARGETARCH
+COPY --from=build /go/src/github.com/rancher/local-path-provisioner/bin/local-path-provisioner-${TARGETARCH} /local-path-csi
+USER 65532:65532
+ENTRYPOINT ["/local-path-csi"]

@@ -1,0 +1,16 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path-csi
+provisioner: local-path.appmana.io
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  # Optional: pin to a specific path in the nodePathMap.
+  # nodePath: /opt/local-path-provisioner
+  # Optional: per-FS quota enforcement. Values: auto | xfs | ext4 | btrfs | ntfs | refs | none.
+  quotaEnforcement: auto
+  # Optional: per-PVC size validation; overrides config.json defaults.
+  # minSize: 1Gi
+  # maxSize: 50Gi

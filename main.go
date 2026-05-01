@@ -2,328 +2,184 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog/v2"
 
-	pvController "sigs.k8s.io/sig-storage-lib-external-provisioner/v11/controller"
+	"github.com/rancher/local-path-provisioner/csi"
+	"github.com/rancher/local-path-provisioner/internal/lpp"
 )
+
+// VERSION is set via -ldflags by scripts/build.
+var VERSION = "0.1.0"
 
 var (
-	VERSION                       = "0.0.1"
-	FlagConfigFile                = "config"
-	FlagProvisionerName           = "provisioner-name"
-	EnvProvisionerName            = "PROVISIONER_NAME"
-	DefaultProvisionerName        = "rancher.io/local-path"
-	FlagNamespace                 = "namespace"
-	EnvNamespace                  = "POD_NAMESPACE"
-	DefaultNamespace              = "local-path-storage"
-	FlagHelperImage               = "helper-image"
-	EnvHelperImage                = "HELPER_IMAGE"
-	DefaultHelperImage            = "rancher/library-busybox:1.32.1"
-	FlagServiceAccountName        = "service-account-name"
-	DefaultServiceAccount         = "local-path-provisioner-service-account"
-	EnvServiceAccountName         = "SERVICE_ACCOUNT_NAME"
-	FlagKubeconfig                = "kubeconfig"
-	DefaultConfigFileKey          = "config.json"
-	DefaultConfigMapName          = "local-path-config"
-	FlagConfigMapName             = "configmap-name"
-	FlagHelperPodFile             = "helper-pod-file"
-	DefaultHelperPodFile          = "helperPod.yaml"
-	FlagWorkerThreads             = "worker-threads"
-	DefaultWorkerThreads          = pvController.DefaultThreadiness
-	FlagProvisioningRetryCount    = "provisioning-retry-count"
-	DefaultProvisioningRetryCount = pvController.DefaultFailedProvisionThreshold
-	FlagDeletionRetryCount        = "deletion-retry-count"
-	DefaultDeletionRetryCount     = pvController.DefaultFailedDeleteThreshold
-	EnvConfigMountPath            = "CONFIG_MOUNT_PATH"
-	FlagKubeClientBurst           = "kube-client-burst"
-	FlagKubeClientQPS             = "kube-client-qps"
+	flagMode               = flag.String("mode", "controller", "operating mode: controller | node")
+	flagEndpoint           = flag.String("csi-endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint")
+	flagNodeID             = flag.String("node-id", "", "kubelet node name (controller mode ignores this; node mode requires it; defaults to $NODE_ID)")
+	flagKubeconfig         = flag.String("kubeconfig", "", "path to kubeconfig (out-of-cluster only)")
+	flagNamespace          = flag.String("namespace", "", "namespace to create helper pods in (defaults to $POD_NAMESPACE or 'local-path-storage')")
+	flagHelperImage        = flag.String("helper-image", "", "image used by helper pods (defaults to $HELPER_IMAGE or 'ghcr.io/appmana/local-path-helper:latest')")
+	flagConfigMapName      = flag.String("configmap-name", "local-path-config", "ConfigMap holding config.json + setup/teardown/resize scripts")
+	flagConfigFile         = flag.String("config", "", "path to config.json (out-of-cluster only; in-cluster uses the ConfigMap)")
+	flagHelperPodFile      = flag.String("helper-pod-file", "", "path to helperPod.yaml (out-of-cluster only)")
+	flagServiceAccountName = flag.String("service-account-name", "", "ServiceAccount used by helper pods (defaults to $SERVICE_ACCOUNT_NAME or 'local-path-provisioner-service-account')")
+	flagDebug              = flag.Bool("debug", false, "enable debug logging")
+	flagKubeClientBurst    = flag.Int("kube-client-burst", rest.DefaultBurst, "kube client burst")
+	flagKubeClientQPS      = flag.Float64("kube-client-qps", float64(rest.DefaultQPS), "kube client QPS")
 )
 
-func cmdNotFound(_ *cli.Context, command string) {
-	panic(fmt.Errorf("unrecognized command: %s", command))
-}
+const (
+	defaultNamespace          = "local-path-storage"
+	defaultHelperImage        = "ghcr.io/appmana/local-path-helper:latest"
+	defaultServiceAccountName = "local-path-provisioner-service-account"
+	defaultConfigFileKey      = "config.json"
+	defaultHelperPodFileKey   = "helperPod.yaml"
+)
 
-func onUsageError(_ *cli.Context, err error, _ bool) error {
-	panic(errors.Wrap(err, "Usage error, please check your command"))
-}
+func main() {
+	flag.Parse()
+	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+	logrus.Infof("local-path-csi version=%s", VERSION)
+	if *flagDebug || os.Getenv("RANCHER_DEBUG") != "" {
+		logrus.SetLevel(logrus.DebugLevel)
+	}
 
-func RegisterShutdownChannel(cancelFn context.CancelFunc) {
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigs
-		klog.Infof("Receive %v to exit", sig)
-		cancelFn()
-	}()
-}
+	ctx, cancel := context.WithCancel(context.Background())
+	registerShutdown(cancel)
 
-func StartCmd() cli.Command {
-	return cli.Command{
-		Name: "start",
-		Flags: []cli.Flag{
-			cli.StringFlag{
-				Name:  FlagConfigFile,
-				Usage: "Required. Provisioner configuration file.",
-				Value: "",
-			},
-			cli.StringFlag{
-				Name:   FlagProvisionerName,
-				Usage:  "Required. Specify Provisioner name.",
-				EnvVar: EnvProvisionerName,
-				Value:  DefaultProvisionerName,
-			},
-			cli.StringFlag{
-				Name:   FlagNamespace,
-				Usage:  "Required. The namespace that Provisioner is running in",
-				EnvVar: EnvNamespace,
-				Value:  DefaultNamespace,
-			},
-			cli.StringFlag{
-				Name:   FlagHelperImage,
-				Usage:  "Required. The helper image used for create/delete directories on the host",
-				EnvVar: EnvHelperImage,
-				Value:  DefaultHelperImage,
-			},
-			cli.StringFlag{
-				Name:  FlagKubeconfig,
-				Usage: "Paths to a kubeconfig. Only required when it is out-of-cluster.",
-				Value: "",
-			},
-			cli.StringFlag{
-				Name:  FlagConfigMapName,
-				Usage: "Required. Specify configmap name.",
-				Value: DefaultConfigMapName,
-			},
-			cli.StringFlag{
-				Name:   FlagServiceAccountName,
-				Usage:  "Required. The ServiceAccountName for deployment",
-				EnvVar: EnvServiceAccountName,
-				Value:  DefaultServiceAccount,
-			},
-			cli.StringFlag{
-				Name:  FlagHelperPodFile,
-				Usage: "Paths to the Helper pod yaml file",
-				Value: "",
-			},
-			cli.IntFlag{
-				Name:  FlagWorkerThreads,
-				Usage: "Number of provisioner worker threads.",
-				Value: DefaultWorkerThreads,
-			},
-			cli.IntFlag{
-				Name:  FlagProvisioningRetryCount,
-				Usage: "Number of retries of failed volume provisioning. 0 means retry indefinitely.",
-				Value: DefaultProvisioningRetryCount,
-			},
-			cli.IntFlag{
-				Name:  FlagDeletionRetryCount,
-				Usage: "Number of retries of failed volume deletion. 0 means retry indefinitely.",
-				Value: DefaultDeletionRetryCount,
-			},
-			cli.IntFlag{
-				Name:  FlagKubeClientBurst,
-				Usage: "Burst value for kubernetes client.",
-				Value: rest.DefaultBurst,
-			},
-			cli.Float64Flag{
-				Name:  FlagKubeClientQPS,
-				Usage: "QPS value for kubernetes client.",
-				Value: float64(rest.DefaultQPS),
-			},
-		},
-		Action: func(c *cli.Context) {
-			if err := startDaemon(c); err != nil {
-				logrus.Fatalf("Error starting daemon: %v", err)
-			}
-		},
+	switch *flagMode {
+	case "controller":
+		if err := runController(ctx); err != nil {
+			logrus.Fatalf("controller: %v", err)
+		}
+	case "node":
+		if err := runNode(ctx); err != nil {
+			logrus.Fatalf("node: %v", err)
+		}
+	default:
+		logrus.Fatalf("invalid --mode %q (expected controller|node)", *flagMode)
 	}
 }
 
-func homeDir() string {
-	if h := os.Getenv("HOME"); h != "" {
-		return h
+func runController(ctx context.Context) error {
+	cfg, err := loadKubeConfig(*flagKubeconfig)
+	if err != nil {
+		return fmt.Errorf("kubeconfig: %v", err)
 	}
-	return os.Getenv("USERPROFILE") // windows
+	cfg.Burst = *flagKubeClientBurst
+	cfg.QPS = float32(*flagKubeClientQPS)
+	kc, err := clientset.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("kube client: %v", err)
+	}
+
+	ns := envOr(*flagNamespace, "POD_NAMESPACE", defaultNamespace)
+	helperImage := envOr(*flagHelperImage, "HELPER_IMAGE", defaultHelperImage)
+	saName := envOr(*flagServiceAccountName, "SERVICE_ACCOUNT_NAME", defaultServiceAccountName)
+
+	configFile := *flagConfigFile
+	if configFile == "" {
+		configFile, err = readConfigMapKey(kc, ns, *flagConfigMapName, defaultConfigFileKey)
+		if err != nil {
+			return fmt.Errorf("read config from ConfigMap %s/%s: %v", ns, *flagConfigMapName, err)
+		}
+	}
+
+	var helperPodYaml string
+	if *flagHelperPodFile != "" {
+		helperPodYaml, err = lpp.LoadFile(*flagHelperPodFile)
+		if err != nil {
+			return fmt.Errorf("load helper pod file %s: %v", *flagHelperPodFile, err)
+		}
+	} else {
+		helperPodYaml, err = readConfigMapKey(kc, ns, *flagConfigMapName, defaultHelperPodFileKey)
+		if err != nil {
+			return fmt.Errorf("read helperPod.yaml from ConfigMap %s/%s: %v", ns, *flagConfigMapName, err)
+		}
+	}
+
+	prov, err := lpp.NewProvisioner(ctx, kc, configFile, ns, helperImage, *flagConfigMapName, saName, helperPodYaml)
+	if err != nil {
+		return fmt.Errorf("new provisioner: %v", err)
+	}
+
+	srv := csi.NewServer(*flagEndpoint, csi.NewIdentityServer(), csi.NewControllerServer(prov), nil)
+	logrus.Infof("local-path CSI driver controller mode (driver=%s version=%s)", csi.DriverName, csi.DriverVersion)
+	return srv.Serve(ctx)
 }
 
-func loadConfig(kubeconfig string) (*rest.Config, error) {
-	if len(kubeconfig) > 0 {
-		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+func runNode(ctx context.Context) error {
+	nodeID := *flagNodeID
+	if nodeID == "" {
+		nodeID = os.Getenv("NODE_ID")
 	}
+	if nodeID == "" {
+		return fmt.Errorf("--node-id or $NODE_ID must be set in node mode")
+	}
+	srv := csi.NewServer(*flagEndpoint, csi.NewIdentityServer(), nil, csi.NewNodeServer(nodeID))
+	logrus.Infof("local-path CSI driver node mode (node=%s driver=%s)", nodeID, csi.DriverName)
+	return srv.Serve(ctx)
+}
 
-	kubeconfigPath := os.Getenv(clientcmd.RecommendedConfigPathEnvVar)
-	if len(kubeconfigPath) > 0 {
-		envVarFiles := filepath.SplitList(kubeconfigPath)
-		for _, f := range envVarFiles {
+func loadKubeConfig(path string) (*rest.Config, error) {
+	if path != "" {
+		return clientcmd.BuildConfigFromFlags("", path)
+	}
+	if envPath := os.Getenv(clientcmd.RecommendedConfigPathEnvVar); envPath != "" {
+		for _, f := range filepath.SplitList(envPath) {
 			if _, err := os.Stat(f); err == nil {
 				return clientcmd.BuildConfigFromFlags("", f)
 			}
 		}
 	}
-
 	if c, err := rest.InClusterConfig(); err == nil {
 		return c, nil
 	}
-
-	kubeconfig = filepath.Join(homeDir(), clientcmd.RecommendedHomeDir, clientcmd.RecommendedFileName)
-	return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = os.Getenv("USERPROFILE")
+	}
+	return clientcmd.BuildConfigFromFlags("", filepath.Join(home, clientcmd.RecommendedHomeDir, clientcmd.RecommendedFileName))
 }
 
-func findConfigFileFromConfigMap(kubeClient clientset.Interface, namespace, configMapName, key string) (string, error) {
-	cm, err := kubeClient.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configMapName, metav1.GetOptions{})
+func readConfigMapKey(kc clientset.Interface, namespace, name, key string) (string, error) {
+	cm, err := kc.CoreV1().ConfigMaps(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
-	value, ok := cm.Data[key]
+	v, ok := cm.Data[key]
 	if !ok {
-		return "", fmt.Errorf("%v is not exist in local-path-config ConfigMap", key)
+		return "", fmt.Errorf("key %q missing in ConfigMap %s/%s", key, namespace, name)
 	}
-	return value, nil
+	return v, nil
 }
 
-func startDaemon(c *cli.Context) error {
-	ctx, cancelFn := context.WithCancel(context.TODO())
-	RegisterShutdownChannel(cancelFn)
-
-	config, err := loadConfig(c.String(FlagKubeconfig))
-	if err != nil {
-		return errors.Wrap(err, "unable to get client config")
+func envOr(value, envKey, def string) string {
+	if value != "" {
+		return value
 	}
-	config.Burst = c.Int(FlagKubeClientBurst)
-	config.QPS = float32(c.Float64(FlagKubeClientQPS))
-
-	kubeClient, err := clientset.NewForConfig(config)
-	if err != nil {
-		return errors.Wrap(err, "unable to get k8s client")
+	if v := os.Getenv(envKey); v != "" {
+		return v
 	}
-
-	provisionerName := c.String(FlagProvisionerName)
-	if provisionerName == "" {
-		return fmt.Errorf("invalid empty flag %v", FlagProvisionerName)
-	}
-	namespace := c.String(FlagNamespace)
-	if namespace == "" {
-		return fmt.Errorf("invalid empty flag %v", FlagNamespace)
-	}
-	configMapName := c.String(FlagConfigMapName)
-	if configMapName == "" {
-		return fmt.Errorf("invalid empty flag %v", FlagConfigMapName)
-	}
-	configFile := c.String(FlagConfigFile)
-	if configFile == "" {
-		configFile, err = findConfigFileFromConfigMap(kubeClient, namespace, configMapName, DefaultConfigFileKey)
-		if err != nil {
-			return fmt.Errorf("invalid empty flag %v and it also does not exist at ConfigMap %v/%v with err: %v", FlagConfigFile, namespace, configMapName, err)
-		}
-	}
-	helperImage := c.String(FlagHelperImage)
-	if helperImage == "" {
-		return fmt.Errorf("invalid empty flag %v", FlagHelperImage)
-	}
-
-	serviceAccountName := c.String(FlagServiceAccountName)
-	if serviceAccountName == "" {
-		return fmt.Errorf("invalid empty flag %v", FlagServiceAccountName)
-	}
-
-	// if helper pod file is not specified, then find the helper pod by configmap with key = helperPod.yaml
-	// if helper pod file is specified with flag FlagHelperPodFile, then load the file
-	helperPodFile := c.String(FlagHelperPodFile)
-	helperPodYaml := ""
-	if helperPodFile == "" {
-		helperPodYaml, err = findConfigFileFromConfigMap(kubeClient, namespace, configMapName, DefaultHelperPodFile)
-		if err != nil {
-			return fmt.Errorf("invalid empty flag %v and it also does not exist at ConfigMap %v/%v with err: %v", FlagHelperPodFile, namespace, configMapName, err)
-		}
-	} else {
-		helperPodYaml, err = loadFile(helperPodFile)
-		if err != nil {
-			return fmt.Errorf("could not open file %v with err: %v", helperPodFile, err)
-		}
-	}
-
-	provisioningRetryCount := c.Int(FlagProvisioningRetryCount)
-	if provisioningRetryCount < 0 {
-		return fmt.Errorf("invalid negative integer flag %v", FlagProvisioningRetryCount)
-	}
-
-	deletionRetryCount := c.Int(FlagDeletionRetryCount)
-	if deletionRetryCount < 0 {
-		return fmt.Errorf("invalid negative integer flag %v", FlagDeletionRetryCount)
-	}
-
-	workerThreads := c.Int(FlagWorkerThreads)
-	if workerThreads <= 0 {
-		return fmt.Errorf("invalid zero or negative integer flag %v", FlagWorkerThreads)
-	}
-
-	provisioner, err := NewProvisioner(ctx, kubeClient, configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml)
-	if err != nil {
-		return err
-	}
-
-	// Start resize controller (handles PVC expand and shrink)
-	resizeCtrl := NewResizeController(ctx, kubeClient, provisioner, provisionerName)
-	go resizeCtrl.Run(ctx)
-
-	pc := pvController.NewProvisionController(
-		ctx,
-		kubeClient,
-		provisionerName,
-		provisioner,
-		pvController.LeaderElection(false),
-		pvController.FailedProvisionThreshold(provisioningRetryCount),
-		pvController.FailedDeleteThreshold(deletionRetryCount),
-		pvController.Threadiness(workerThreads),
-	)
-	logrus.Debug("Provisioner started")
-	pc.Run(ctx)
-	logrus.Debug("Provisioner stopped")
-	return nil
+	return def
 }
 
-func main() {
-	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-
-	a := cli.NewApp()
-	a.Version = VERSION
-	a.Usage = "Local Path Provisioner"
-
-	a.Before = func(c *cli.Context) error {
-		if c.GlobalBool("debug") {
-			logrus.SetLevel(logrus.DebugLevel)
-		}
-		return nil
-	}
-
-	a.Flags = []cli.Flag{
-		cli.BoolFlag{
-			Name:   "debug, d",
-			Usage:  "enable debug logging level",
-			EnvVar: "RANCHER_DEBUG",
-		},
-	}
-	a.Commands = []cli.Command{
-		StartCmd(),
-	}
-	a.CommandNotFound = cmdNotFound
-	a.OnUsageError = onUsageError
-
-	if err := a.Run(os.Args); err != nil {
-		logrus.Fatalf("Critical error: %v", err)
-	}
+func registerShutdown(cancel context.CancelFunc) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		s := <-sigs
+		logrus.Infof("received signal %v, shutting down", s)
+		cancel()
+	}()
 }

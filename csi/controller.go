@@ -38,6 +38,7 @@ func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.
 	// test suites when a capability is not advertised.
 	caps := []csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 	}
 	out := make([]*csi.ControllerServiceCapability, 0, len(caps))
 	for _, c := range caps {
@@ -337,9 +338,112 @@ func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, _ *csi.
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
-// ControllerExpandVolume is wired in M3.
-func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, _ *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerExpandVolume not yet implemented (M3)")
+// ControllerExpandVolume validates the new size, atomically updates the
+// CapacityTracker, and returns NodeExpansionRequired=true. The helper pod
+// that touches the filesystem runs from NodeExpandVolume.
+func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	if req.VolumeId == "" {
+		return nil, status.Error(codes.InvalidArgument, "VolumeId missing")
+	}
+	if req.CapacityRange == nil {
+		return nil, status.Error(codes.InvalidArgument, "CapacityRange missing")
+	}
+	requestedBytes := req.CapacityRange.GetRequiredBytes()
+	if requestedBytes <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "CapacityRange.RequiredBytes must be > 0")
+	}
+
+	pv, err := cs.provisioner.KubeClient().CoreV1().PersistentVolumes().Get(ctx, req.VolumeId, metav1.GetOptions{})
+	if err != nil {
+		if k8serror.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound, "volume %s not found", req.VolumeId)
+		}
+		return nil, status.Errorf(codes.Internal, "PV lookup: %v", err)
+	}
+	if pv.Spec.PersistentVolumeSource.CSI == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "PV %s is not a CSI volume", req.VolumeId)
+	}
+	attrs := pv.Spec.PersistentVolumeSource.CSI.VolumeAttributes
+	nodeName := attrs[VolumeContextNode]
+	path := attrs[VolumeContextPath]
+	if path == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "PV %s has no path attribute", req.VolumeId)
+	}
+
+	cur := pv.Spec.Capacity[v1.ResourceStorage]
+	currentBytes := cur.Value()
+	if requestedBytes < currentBytes {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"shrink not supported: PV %s currently %d bytes, requested %d", req.VolumeId, currentBytes, requestedBytes)
+	}
+	if requestedBytes == currentBytes {
+		// Idempotent: already at the requested size.
+		return &csi.ControllerExpandVolumeResponse{
+			CapacityBytes:         currentBytes,
+			NodeExpansionRequired: false,
+		}, nil
+	}
+
+	// Validate min/max from StorageClass on the PV (best-effort: a missing
+	// SC name returns the default config).
+	cfg, err := cs.provisioner.PickConfig(pv.Spec.StorageClassName)
+	if err != nil {
+		cfg, err = cs.provisioner.PickConfig("")
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "pickConfig: %v", err)
+		}
+	}
+	storage := *resource.NewQuantity(requestedBytes, resource.BinarySI)
+	if cfg.MaxSize != nil && storage.Cmp(*cfg.MaxSize) > 0 {
+		return nil, status.Errorf(codes.OutOfRange, "expand to %v exceeds maxSize %v", storage.String(), cfg.MaxSize.String())
+	}
+
+	// Atomically adjust per-path budget. Don't trip over a missing budget
+	// (paths configured without maxCapacity).
+	basePath := filepath.Dir(path)
+	npMap := cfg.NodePathMap[nodeName]
+	if npMap == nil {
+		npMap = cfg.NodePathMap[lpp.NodeDefaultNonListedNodes]
+	}
+	var maxCap *resource.Quantity
+	if npMap != nil && npMap.Paths[basePath] != nil {
+		maxCap = npMap.Paths[basePath].MaxCapacity
+	}
+	if !cs.provisioner.CapacityTracker().TryResize(nodeName, basePath, currentBytes, requestedBytes, maxCap) {
+		return nil, status.Errorf(codes.ResourceExhausted, "expand of %s on %s would exceed path budget", req.VolumeId, basePath)
+	}
+
+	// Dispatch the resize helper pod. For local-path the resize is purely a
+	// quota adjustment (or a no-op when no quota is configured); the
+	// directory itself doesn't need to grow. NodeExpansionRequired=false
+	// because nothing happens on the kubelet side.
+	mode := v1.PersistentVolumeFilesystem
+	if pv.Spec.VolumeMode != nil {
+		mode = *pv.Spec.VolumeMode
+	}
+	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
+		Type: lpp.ActionTypeResize,
+		Cmd:  cs.provisioner.ResizeCommand(),
+		Volume: lpp.VolumeOptions{
+			Name:        pv.Name,
+			Path:        path,
+			Mode:        mode,
+			SizeInBytes: requestedBytes,
+			Node:        nodeName,
+			QuotaType:   attrs[VolumeContextQuotaType],
+		},
+		Config: cfg,
+	}); err != nil {
+		// Roll back the tracker on helper failure.
+		cs.provisioner.CapacityTracker().TryResize(nodeName, basePath, requestedBytes, currentBytes, maxCap)
+		return nil, status.Errorf(codes.Internal, "resize helper pod failed: %v", err)
+	}
+
+	logrus.Infof("ControllerExpandVolume %s: %d -> %d bytes on %s:%s", req.VolumeId, currentBytes, requestedBytes, nodeName, path)
+	return &csi.ControllerExpandVolumeResponse{
+		CapacityBytes:         requestedBytes,
+		NodeExpansionRequired: false,
+	}, nil
 }
 
 // GetCapacity is wired in M2.

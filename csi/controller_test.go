@@ -310,6 +310,97 @@ func TestControllerServer_CreateVolume_IdempotentSameSize(t *testing.T) {
 	assert.Empty(t, f.calls(), "idempotent CreateVolume must not run another helper pod")
 }
 
+func TestControllerServer_ControllerExpandVolume_HappyPath(t *testing.T) {
+	pv := makeCSIPV("pv-1", "n1", "/data/pv-1", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	resp, err := f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "pv-1",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 << 30},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(5<<30), resp.CapacityBytes)
+	assert.False(t, resp.NodeExpansionRequired)
+	calls := f.calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, lpp.ActionTypeResize, calls[0].Type)
+	assert.Equal(t, int64(5<<30), calls[0].Volume.SizeInBytes)
+	// Tracker should now hold 5Gi (initCapacityTracker loaded 1Gi, then we resized to 5Gi).
+	assert.Equal(t, int64(5<<30), f.prov.CapacityTracker().GetAllocated("n1", "/data"))
+}
+
+func TestControllerServer_ControllerExpandVolume_MissingPV(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	_, err := f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "missing",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 << 30},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.NotFound, status.Code(err))
+}
+
+func TestControllerServer_ControllerExpandVolume_ShrinkRejected(t *testing.T) {
+	pv := makeCSIPV("pv-1", "n1", "/data/pv-1", "5Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	_, err := f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "pv-1",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 1 << 30}, // shrink 5Gi -> 1Gi
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Empty(t, f.calls(), "rejected expand must not run helper")
+}
+
+func TestControllerServer_ControllerExpandVolume_IdempotentAtSize(t *testing.T) {
+	pv := makeCSIPV("pv-1", "n1", "/data/pv-1", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	resp, err := f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "pv-1",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 1 << 30},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1<<30), resp.CapacityBytes)
+	assert.False(t, resp.NodeExpansionRequired)
+	assert.Empty(t, f.calls(), "idempotent expand must not run helper")
+}
+
+func TestControllerServer_ControllerExpandVolume_BudgetExceeded(t *testing.T) {
+	pv := makeCSIPV("pv-1", "n1", "/data/pv-1", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":[{"path":"/data","maxCapacity":"2Gi"}]}]}`, pv)
+	_, err := f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "pv-1",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 << 30}, // 5Gi > 2Gi cap
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
+}
+
+func TestControllerServer_ControllerExpandVolume_HelperFailureRollsBack(t *testing.T) {
+	pv := makeCSIPV("pv-1", "n1", "/data/pv-1", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":[{"path":"/data","maxCapacity":"10Gi"}]}]}`, pv)
+	f.prov.SetRunHelperPodFn(func(_ context.Context, _ lpp.HelperAction) error {
+		return assertableError("helper boom")
+	})
+	_, err := f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "pv-1",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 << 30},
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	// Tracker rolled back to the original 1Gi (initCapacityTracker baseline).
+	assert.Equal(t, int64(1<<30), f.prov.CapacityTracker().GetAllocated("n1", "/data"))
+}
+
+func TestControllerServer_ControllerExpandVolume_MissingArgs(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	_, err := f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	_, err = f.cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{VolumeId: "v"})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
 func TestControllerServer_CreateVolume_RejectAlreadyExistsDifferentSize(t *testing.T) {
 	pv := makeCSIPV("pv-existing", "n1", "/data/pv-existing", "1Gi", v1.PersistentVolumeReclaimDelete)
 	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
@@ -327,10 +418,10 @@ func TestControllerServer_ControllerGetCapabilities(t *testing.T) {
 	for _, c := range resp.Capabilities {
 		have[c.GetRpc().Type] = true
 	}
-	// M1 wires only CREATE_DELETE_VOLUME. EXPAND/GET_CAPACITY/SNAPSHOT
-	// are advertised as their milestones (M2/M3/M7) land.
+	// M3 wires CREATE_DELETE_VOLUME + EXPAND_VOLUME. GET_CAPACITY (M2),
+	// CREATE_DELETE_SNAPSHOT/LIST_SNAPSHOTS (M7) added in their milestones.
 	assert.True(t, have[csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME])
-	assert.False(t, have[csi.ControllerServiceCapability_RPC_EXPAND_VOLUME])
+	assert.True(t, have[csi.ControllerServiceCapability_RPC_EXPAND_VOLUME])
 	assert.False(t, have[csi.ControllerServiceCapability_RPC_GET_CAPACITY])
 	assert.False(t, have[csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT])
 }
@@ -338,10 +429,6 @@ func TestControllerServer_ControllerGetCapabilities(t *testing.T) {
 func TestControllerServer_PendingMilestones_ReturnUnimplemented(t *testing.T) {
 	cs := NewControllerServer(nil)
 	cases := []func() error{
-		func() error {
-			_, err := cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{})
-			return err
-		},
 		func() error { _, err := cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{}); return err },
 		func() error {
 			_, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{})

@@ -118,8 +118,13 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
+  # Node-side capacity reporter writes free-bytes-by-path annotations.
   - apiGroups: [""]
     resources: ["nodes"]
+    verbs: ["get", "patch"]
+  # Node-side reporter reads the configmap to know which paths to statfs.
+  - apiGroups: [""]
+    resources: ["configmaps"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

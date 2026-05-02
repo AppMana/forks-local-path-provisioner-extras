@@ -10,6 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	v1 "k8s.io/api/core/v1"
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -39,6 +40,7 @@ func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.
 	caps := []csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 	}
 	out := make([]*csi.ControllerServiceCapability, 0, len(caps))
 	for _, c := range caps {
@@ -446,9 +448,88 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 	}, nil
 }
 
-// GetCapacity is wired in M2.
-func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "GetCapacity not yet implemented (M2)")
+// GetCapacity reads the Node annotation written by the node-side capacity
+// reporter, subtracts allocated bytes per (node, path) from the
+// CapacityTracker, and returns the sum of remaining free bytes for the
+// requested topology. csi-provisioner with --enable-capacity polls this
+// per (StorageClass, topology) tuple and publishes CSIStorageCapacity
+// objects the kube-scheduler consumes.
+func (cs *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
+	nodeName := ""
+	if req.AccessibleTopology != nil {
+		nodeName = req.AccessibleTopology.Segments[TopologyKeyNode]
+	}
+	if nodeName == "" {
+		// Topology-unaware capacity isn't meaningful for a per-node driver;
+		// return 0 so the scheduler treats this as no-info rather than
+		// infinite.
+		return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
+	}
+
+	node, err := cs.provisioner.KubeClient().CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		if k8serror.IsNotFound(err) {
+			return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "Node %s lookup: %v", nodeName, err)
+	}
+	free := lpp.FreeBytesByPath(node.Annotations[lpp.FreeBytesAnnotationKey])
+	if free == nil {
+		// Annotation missing → reporter hasn't run yet, treat as zero.
+		return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
+	}
+
+	cfgName := req.Parameters["storageClassConfig"]
+	cfg, err := cs.provisioner.PickConfig(cfgName)
+	if err != nil {
+		// Fall back to default config rather than erroring; csi-provisioner
+		// polls many (SC, topology) tuples and surfacing a hard error
+		// floods logs.
+		cfg, err = cs.provisioner.PickConfig("")
+		if err != nil {
+			return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
+		}
+	}
+	tracker := cs.provisioner.CapacityTracker()
+	npMap := cfg.NodePathMap[nodeName]
+	if npMap == nil {
+		npMap = cfg.NodePathMap[lpp.NodeDefaultNonListedNodes]
+	}
+	if npMap == nil {
+		// No paths configured for this node in this StorageClass — node
+		// can't satisfy this StorageClass at all.
+		return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
+	}
+
+	var total int64
+	var maxSingle int64
+	for path := range npMap.Paths {
+		fb, ok := free[path]
+		if !ok || fb < 0 {
+			continue
+		}
+		alloc := tracker.GetAllocated(nodeName, path)
+		remaining := fb - alloc
+		if pc := npMap.Paths[path]; pc != nil && pc.MaxCapacity != nil {
+			budget := pc.MaxCapacity.Value() - alloc
+			if budget < remaining {
+				remaining = budget
+			}
+		}
+		if remaining < 0 {
+			remaining = 0
+		}
+		total += remaining
+		if remaining > maxSingle {
+			maxSingle = remaining
+		}
+	}
+
+	resp := &csi.GetCapacityResponse{AvailableCapacity: total}
+	if maxSingle > 0 {
+		resp.MaximumVolumeSize = wrapperspb.Int64(maxSingle)
+	}
+	return resp, nil
 }
 
 // CreateSnapshot / DeleteSnapshot / ListSnapshots are wired in M7.

@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -310,6 +311,119 @@ func TestControllerServer_CreateVolume_IdempotentSameSize(t *testing.T) {
 	assert.Empty(t, f.calls(), "idempotent CreateVolume must not run another helper pod")
 }
 
+// freeBytesNodeAnnotation builds a Node with the capacity reporter's annotation.
+func freeBytesNodeAnnotation(name string, free map[string]int64) *v1.Node {
+	body, _ := json.Marshal(free)
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Annotations: map[string]string{
+				lpp.FreeBytesAnnotationKey: string(body),
+			},
+		},
+	}
+}
+
+func TestControllerServer_GetCapacity_NoTopology(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), resp.AvailableCapacity)
+}
+
+func TestControllerServer_GetCapacity_NodeMissing(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "ghost"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), resp.AvailableCapacity)
+}
+
+func TestControllerServer_GetCapacity_NodeAnnotationMissing(t *testing.T) {
+	node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}} // no free-bytes annotation
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, node)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "n1"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), resp.AvailableCapacity)
+}
+
+func TestControllerServer_GetCapacity_HappyPath(t *testing.T) {
+	node := freeBytesNodeAnnotation("n1", map[string]int64{"/data": 10 << 30})
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, node)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "n1"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(10)<<30, resp.AvailableCapacity)
+	require.NotNil(t, resp.MaximumVolumeSize)
+	assert.Equal(t, int64(10)<<30, resp.MaximumVolumeSize.Value)
+}
+
+func TestControllerServer_GetCapacity_SubtractsAllocatedFromTracker(t *testing.T) {
+	node := freeBytesNodeAnnotation("n1", map[string]int64{"/data": 10 << 30})
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, node)
+	f.prov.CapacityTracker().Allocate("n1", "/data", 4<<30)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "n1"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(6)<<30, resp.AvailableCapacity)
+	assert.Equal(t, int64(6)<<30, resp.MaximumVolumeSize.Value)
+}
+
+func TestControllerServer_GetCapacity_RespectsMaxCapacity(t *testing.T) {
+	node := freeBytesNodeAnnotation("n1", map[string]int64{"/data": 100 << 30})
+	cfg := `{"nodePathMap":[{"node":"n1","paths":[{"path":"/data","maxCapacity":"5Gi"}]}]}`
+	f := newFixture(t, cfg, node)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "n1"}},
+	})
+	require.NoError(t, err)
+	// Filesystem has 100Gi free but maxCapacity caps it to 5Gi.
+	assert.Equal(t, int64(5)<<30, resp.AvailableCapacity)
+}
+
+func TestControllerServer_GetCapacity_SumsMultiplePaths(t *testing.T) {
+	node := freeBytesNodeAnnotation("n1", map[string]int64{
+		"/data/a": 3 << 30,
+		"/data/b": 7 << 30,
+		"/other":  100 << 30, // not configured for this SC, ignored
+	})
+	cfg := `{"nodePathMap":[{"node":"n1","paths":["/data/a","/data/b"]}]}`
+	f := newFixture(t, cfg, node)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "n1"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(10)<<30, resp.AvailableCapacity)
+	require.NotNil(t, resp.MaximumVolumeSize)
+	assert.Equal(t, int64(7)<<30, resp.MaximumVolumeSize.Value, "MaximumVolumeSize is the largest single path")
+}
+
+func TestControllerServer_GetCapacity_NodeNotInConfig(t *testing.T) {
+	node := freeBytesNodeAnnotation("ghost", map[string]int64{"/data": 10 << 30})
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, node)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "ghost"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), resp.AvailableCapacity)
+}
+
+func TestControllerServer_GetCapacity_DefaultPathFallback(t *testing.T) {
+	node := freeBytesNodeAnnotation("anynode", map[string]int64{"/opt/lpp": 5 << 30})
+	cfg := `{"nodePathMap":[{"node":"DEFAULT_PATH_FOR_NON_LISTED_NODES","paths":["/opt/lpp"]}]}`
+	f := newFixture(t, cfg, node)
+	resp, err := f.cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{
+		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: "anynode"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(5)<<30, resp.AvailableCapacity)
+}
+
 func TestControllerServer_ControllerExpandVolume_HappyPath(t *testing.T) {
 	pv := makeCSIPV("pv-1", "n1", "/data/pv-1", "1Gi", v1.PersistentVolumeReclaimDelete)
 	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
@@ -418,18 +532,17 @@ func TestControllerServer_ControllerGetCapabilities(t *testing.T) {
 	for _, c := range resp.Capabilities {
 		have[c.GetRpc().Type] = true
 	}
-	// M3 wires CREATE_DELETE_VOLUME + EXPAND_VOLUME. GET_CAPACITY (M2),
-	// CREATE_DELETE_SNAPSHOT/LIST_SNAPSHOTS (M7) added in their milestones.
+	// CREATE_DELETE_VOLUME + EXPAND_VOLUME + GET_CAPACITY are wired.
+	// CREATE_DELETE_SNAPSHOT/LIST_SNAPSHOTS land in M7.
 	assert.True(t, have[csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME])
 	assert.True(t, have[csi.ControllerServiceCapability_RPC_EXPAND_VOLUME])
-	assert.False(t, have[csi.ControllerServiceCapability_RPC_GET_CAPACITY])
+	assert.True(t, have[csi.ControllerServiceCapability_RPC_GET_CAPACITY])
 	assert.False(t, have[csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT])
 }
 
 func TestControllerServer_PendingMilestones_ReturnUnimplemented(t *testing.T) {
 	cs := NewControllerServer(nil)
 	cases := []func() error{
-		func() error { _, err := cs.GetCapacity(context.Background(), &csi.GetCapacityRequest{}); return err },
 		func() error {
 			_, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{})
 			return err

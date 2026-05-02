@@ -39,11 +39,16 @@ spec:
           args:
             - --mode=node
             - --csi-endpoint=unix:///csi/csi.sock
+            - --namespace=$(POD_NAMESPACE)
           env:
             - name: NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           volumeMounts:
             - name: plugin-dir
               mountPath: /csi

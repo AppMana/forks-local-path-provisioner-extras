@@ -203,7 +203,20 @@ esac
 
 ### 5.5 Snapshots → standard VolumeSnapshot CRDs
 
-Implements `csi.ControllerServer.CreateSnapshot`/`DeleteSnapshot`/`ListSnapshots`. The csi-snapshotter sidecar wires up `VolumeSnapshot` → `VolumeSnapshotContent` → our RPC.
+**Implemented (M7).** `csi.ControllerServer.CreateSnapshot` / `DeleteSnapshot` / `ListSnapshots`; the csi-snapshotter sidecar wires `VolumeSnapshot` → `VolumeSnapshotContent` → our RPCs. As-built notes:
+
+- **Snapshot ID** = `<sourceVolumeID>/<snapshotName>`. The source-volume prefix lets `DeleteSnapshot` re-derive the on-node path (`dirname(sourcePath)/.snapshots/<name>`) even after a controller restart (the in-memory `SnapshotTracker` doesn't survive restarts). A name index in the tracker enforces the CSI rule that snapshot *names* are globally unique (cross-source name reuse → `AlreadyExists`).
+- **On-node layout**: snapshot data at `<basePath>/.snapshots/<name>`, plus a self-describing JSON sidecar `<basePath>/.snapshots/<name>.json` (sourcePath, fsType, sizeBytes, creationTime).
+- **Per-FS primitive** in `package/helper-image/scripts/snapshot.sh`:
+  - btrfs: `btrfs subvolume snapshot -r SRC DST` — atomic, copy-on-write.
+  - xfs: `cp --reflink=always -aR SRC DST` after checking `xfs_info | grep reflink=1`; **not atomic** across in-flight writes — quiesce the workload.
+  - ext4 / other: `die "snapshots not supported"` → controller maps to `FailedPrecondition`.
+  - `-a delete-snapshot` mode removes the snapshot dir + sidecar.
+- **Restore** (`restore.sh`): rw clone (btrfs rw subvolume snapshot / xfs reflink / plain `cp -a` fallback) then `apply_quota` against the destination FS. Wired into `CreateVolume` via `VolumeContentSource.Snapshot`: the new volume is forced onto the snapshot's node; a conflicting scheduled node → `ResourceExhausted`.
+- **External dependency**: the external-snapshotter CRDs + snapshot-controller must be installed cluster-wide (the csi-snapshotter sidecar needs them). `deploy/csi/volumesnapshotclass.yaml` ships a `VolumeSnapshotClass` for the driver and documents this.
+- **Limitations**: ext4 has no snapshots. xfs reflink snapshots are crash-consistent only. Snapshots are node-local — cross-node restore needs app-level replication. After a controller restart, `ListSnapshots` only shows snapshots created since (Create→List→Delete within one lifetime is the common case and is unaffected); `DeleteSnapshot` and restore stay correct because they re-derive state from the source PV / the snapshot ID.
+
+The original sketch below predates the implementation; kept for context.
 
 ```go
 func (cs *ControllerServer) CreateSnapshot(ctx, req) (*CreateSnapshotResponse, error) {

@@ -55,6 +55,8 @@ func CanonicalizeConfig(data *ConfigData) (*Config, error) {
 	cfg.SetupCommand = data.SetupCommand
 	cfg.TeardownCommand = data.TeardownCommand
 	cfg.ResizeCommand = data.ResizeCommand
+	cfg.SnapshotCommand = data.SnapshotCommand
+	cfg.RestoreCommand = data.RestoreCommand
 	if data.CmdTimeoutSeconds > 0 {
 		cfg.CmdTimeoutSeconds = data.CmdTimeoutSeconds
 	} else {

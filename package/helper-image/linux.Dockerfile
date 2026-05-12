@@ -21,7 +21,9 @@ RUN apt-get update \
       coreutils \
  && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/common.sh scripts/setup.sh scripts/teardown.sh scripts/resize.sh /opt/local-path-provisioner/
+COPY scripts/common.sh scripts/setup.sh scripts/teardown.sh scripts/resize.sh \
+     scripts/snapshot.sh scripts/restore.sh \
+     /opt/local-path-provisioner/
 RUN chmod 0755 /opt/local-path-provisioner/*.sh
 
 # The helper pod's command is set by the CSI controller (config.json

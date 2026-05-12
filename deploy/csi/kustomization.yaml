@@ -7,3 +7,7 @@ resources:
   - controller.yaml
   - node.yaml
   - storageclass.yaml
+  # Requires the external-snapshotter CRDs + snapshot-controller installed
+  # cluster-wide (see volumesnapshotclass.yaml). The controller Deployment's
+  # csi-snapshotter sidecar also needs them.
+  - volumesnapshotclass.yaml

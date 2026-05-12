@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	v1 "k8s.io/api/core/v1"
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
@@ -41,6 +44,8 @@ func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 	}
 	out := make([]*csi.ControllerServiceCapability, 0, len(caps))
 	for _, c := range caps {
@@ -169,10 +174,32 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Errorf(codes.OutOfRange, "PVC requests %v which exceeds maximum size %v", storage.String(), maxSize.String())
 	}
 
+	// If the request is "create from snapshot", the new volume must land on
+	// the snapshot's node (snapshots are node-local). Resolve that first so
+	// it overrides / constrains the topology pick.
+	var srcSnapshot *lpp.SnapshotInfo
+	if vcs := req.GetVolumeContentSource(); vcs != nil {
+		if snap := vcs.GetSnapshot(); snap != nil {
+			info, ok := cs.provisioner.SnapshotTracker().Get(snap.GetSnapshotId())
+			if !ok {
+				return nil, status.Errorf(codes.NotFound, "snapshot %s not found (controller may have restarted; recreate the snapshot or restore on its original node)", snap.GetSnapshotId())
+			}
+			srcSnapshot = &info
+		}
+	}
+
 	// Pick node from preferred topology unless shared FS.
 	var nodeName string
 	if !sharedFS {
 		nodeName = pickPreferredNode(req.AccessibilityRequirements)
+		if srcSnapshot != nil {
+			if nodeName != "" && nodeName != srcSnapshot.Node {
+				return nil, status.Errorf(codes.ResourceExhausted,
+					"snapshot %s is on node %s but the pod was scheduled to %s; restore requires the snapshot's node",
+					srcSnapshot.SnapshotID, srcSnapshot.Node, nodeName)
+			}
+			nodeName = srcSnapshot.Node
+		}
 		if nodeName == "" {
 			return nil, status.Error(codes.InvalidArgument,
 				"no preferred topology with kubernetes.io/hostname provided — "+
@@ -210,11 +237,12 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 	}
 
-	// Run setup helper pod.
-	setupCmd := cs.provisioner.SetupCommand()
-	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
+	// Run the setup helper pod — or the restore helper pod when cloning a
+	// snapshot. Restore clones <snapshot>/.snapshots/<name> into the new
+	// volume directory and then applies quota.
+	action := lpp.HelperAction{
 		Type: lpp.ActionTypeCreate,
-		Cmd:  setupCmd,
+		Cmd:  cs.provisioner.SetupCommand(),
 		Volume: lpp.VolumeOptions{
 			Name:        pvName,
 			Path:        path,
@@ -224,7 +252,17 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			QuotaType:   quotaType,
 		},
 		Config: cfg,
-	}); err != nil {
+	}
+	if srcSnapshot != nil {
+		action.Type = lpp.ActionTypeRestore
+		action.Cmd = cs.provisioner.RestoreCommand()
+		action.Volume.SnapDir = srcSnapshot.SnapshotPath
+		if quotaType == "" {
+			action.Volume.QuotaType = srcSnapshot.QuotaType
+			quotaType = srcSnapshot.QuotaType
+		}
+	}
+	if err := cs.provisioner.RunHelperPod(ctx, action); err != nil {
 		return nil, status.Errorf(codes.Internal, "helper pod failed: %v", err)
 	}
 
@@ -241,6 +279,13 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 				VolumeContextQuotaType: quotaType,
 			},
 		},
+	}
+	if srcSnapshot != nil {
+		resp.Volume.ContentSource = &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: srcSnapshot.SnapshotID},
+			},
+		}
 	}
 	if !sharedFS {
 		resp.Volume.AccessibleTopology = []*csi.Topology{
@@ -532,17 +577,212 @@ func (cs *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacit
 	return resp, nil
 }
 
-// CreateSnapshot / DeleteSnapshot / ListSnapshots are wired in M7.
-func (cs *ControllerServer) CreateSnapshot(_ context.Context, _ *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "CreateSnapshot not yet implemented (M7)")
+// snapshotsSubdir is the per-base-path directory snapshots are cloned into.
+const snapshotsSubdir = ".snapshots"
+
+// snapshotID encodes the source volume ID and the requested snapshot name so
+// DeleteSnapshot can re-derive the node + path even after a controller
+// restart (the in-memory SnapshotTracker doesn't survive restarts). Neither
+// component contains "/" (both are RFC 1123 names).
+func snapshotID(sourceVolumeID, name string) string { return sourceVolumeID + "/" + name }
+
+func splitSnapshotID(id string) (sourceVolumeID, name string, ok bool) {
+	i := strings.IndexByte(id, '/')
+	if i <= 0 || i == len(id)-1 {
+		return "", "", false
+	}
+	return id[:i], id[i+1:], true
 }
 
-func (cs *ControllerServer) DeleteSnapshot(_ context.Context, _ *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "DeleteSnapshot not yet implemented (M7)")
+// snapshotPathFor returns the on-node path the snapshot named `name` of the
+// volume at `sourcePath` lives at: <basePath>/.snapshots/<name>.
+func snapshotPathFor(sourcePath, name string) string {
+	return filepath.Join(filepath.Dir(sourcePath), snapshotsSubdir, name)
 }
 
-func (cs *ControllerServer) ListSnapshots(_ context.Context, _ *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ListSnapshots not yet implemented (M7)")
+func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot name missing")
+	}
+	if req.SourceVolumeId == "" {
+		return nil, status.Error(codes.InvalidArgument, "SourceVolumeId missing")
+	}
+	id := snapshotID(req.SourceVolumeId, req.Name)
+
+	// CSI spec: snapshot names are globally unique. Same name + same source →
+	// idempotent (return the existing snapshot); same name + different source
+	// → AlreadyExists.
+	if existing, ok := cs.provisioner.SnapshotTracker().GetByName(req.Name); ok {
+		if existing.SourceVolumeID != req.SourceVolumeId {
+			return nil, status.Errorf(codes.AlreadyExists, "snapshot %q already exists for source volume %s", req.Name, existing.SourceVolumeID)
+		}
+		return &csi.CreateSnapshotResponse{Snapshot: toCSISnapshot(existing)}, nil
+	}
+
+	pv, err := cs.provisioner.KubeClient().CoreV1().PersistentVolumes().Get(ctx, req.SourceVolumeId, metav1.GetOptions{})
+	if err != nil {
+		if k8serror.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound, "source volume %s not found", req.SourceVolumeId)
+		}
+		return nil, status.Errorf(codes.Internal, "source PV lookup: %v", err)
+	}
+	if pv.Spec.PersistentVolumeSource.CSI == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "source volume %s is not a CSI volume", req.SourceVolumeId)
+	}
+	attrs := pv.Spec.PersistentVolumeSource.CSI.VolumeAttributes
+	node := attrs[VolumeContextNode]
+	sourcePath := attrs[VolumeContextPath]
+	quotaType := attrs[VolumeContextQuotaType]
+	if sourcePath == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "source PV %s has no path attribute", req.SourceVolumeId)
+	}
+
+	cfg, err := cs.provisioner.PickConfig(pv.Spec.StorageClassName)
+	if err != nil {
+		cfg, err = cs.provisioner.PickConfig("")
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "pickConfig: %v", err)
+		}
+	}
+	storage := pv.Spec.Capacity[v1.ResourceStorage]
+	snapPath := snapshotPathFor(sourcePath, req.Name)
+	mode := v1.PersistentVolumeFilesystem
+	if pv.Spec.VolumeMode != nil {
+		mode = *pv.Spec.VolumeMode
+	}
+
+	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
+		Type: lpp.ActionTypeSnapshot,
+		Cmd:  cs.provisioner.SnapshotCommand(),
+		Volume: lpp.VolumeOptions{
+			Name:        req.Name,
+			Path:        sourcePath,
+			SnapDir:     snapPath,
+			Mode:        mode,
+			SizeInBytes: storage.Value(),
+			Node:        node,
+			QuotaType:   quotaType,
+		},
+		Config: cfg,
+	}); err != nil {
+		// FailedPrecondition for "filesystem doesn't support snapshots" so
+		// callers can distinguish it from a transient error.
+		if strings.Contains(err.Error(), "snapshots not supported") {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "snapshot helper pod failed: %v", err)
+	}
+
+	info := lpp.SnapshotInfo{
+		SnapshotID:     id,
+		Name:           req.Name,
+		SourceVolumeID: req.SourceVolumeId,
+		Node:           node,
+		SourcePath:     sourcePath,
+		SnapshotPath:   snapPath,
+		QuotaType:      quotaType,
+		SizeBytes:      storage.Value(),
+		CreationTime:   time.Now(),
+		ReadyToUse:     true,
+	}
+	cs.provisioner.SnapshotTracker().Put(info)
+	logrus.Infof("CreateSnapshot %s of %s on %s:%s", id, req.SourceVolumeId, node, snapPath)
+	return &csi.CreateSnapshotResponse{Snapshot: toCSISnapshot(info)}, nil
+}
+
+func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
+	if req.SnapshotId == "" {
+		return nil, status.Error(codes.InvalidArgument, "SnapshotId missing")
+	}
+	sourceVolumeID, name, ok := splitSnapshotID(req.SnapshotId)
+	if !ok {
+		// Unrecognized ID format → nothing we created; idempotent success.
+		logrus.Warnf("DeleteSnapshot %s: unrecognized ID format, treating as already deleted", req.SnapshotId)
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
+
+	// Prefer the tracker; fall back to re-deriving from the source PV.
+	var node, snapPath, quotaType string
+	if info, present := cs.provisioner.SnapshotTracker().Get(req.SnapshotId); present {
+		node, snapPath, quotaType = info.Node, info.SnapshotPath, info.QuotaType
+	} else {
+		pv, err := cs.provisioner.KubeClient().CoreV1().PersistentVolumes().Get(ctx, sourceVolumeID, metav1.GetOptions{})
+		if err != nil {
+			if k8serror.IsNotFound(err) {
+				logrus.Warnf("DeleteSnapshot %s: source PV gone and not in tracker; snapshot dir may leak on the node", req.SnapshotId)
+				cs.provisioner.SnapshotTracker().Delete(req.SnapshotId)
+				return &csi.DeleteSnapshotResponse{}, nil
+			}
+			return nil, status.Errorf(codes.Internal, "source PV lookup: %v", err)
+		}
+		if pv.Spec.PersistentVolumeSource.CSI == nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "source volume %s is not a CSI volume", sourceVolumeID)
+		}
+		attrs := pv.Spec.PersistentVolumeSource.CSI.VolumeAttributes
+		node = attrs[VolumeContextNode]
+		quotaType = attrs[VolumeContextQuotaType]
+		snapPath = snapshotPathFor(attrs[VolumeContextPath], name)
+	}
+
+	cfg, err := cs.provisioner.PickConfig("")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "pickConfig: %v", err)
+	}
+	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
+		Type: lpp.ActionTypeDeleteSnapshot,
+		Cmd:  cs.provisioner.SnapshotCommand(),
+		Volume: lpp.VolumeOptions{
+			Name:      name,
+			Path:      filepath.Dir(snapPath), // a real dir under <basePath>; VOL_DIR is unused by delete-snapshot
+			SnapDir:   snapPath,
+			Mode:      v1.PersistentVolumeFilesystem,
+			Node:      node,
+			QuotaType: quotaType,
+		},
+		Config: cfg,
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete-snapshot helper pod failed: %v", err)
+	}
+	cs.provisioner.SnapshotTracker().Delete(req.SnapshotId)
+	logrus.Infof("DeleteSnapshot %s: removed %s on %s", req.SnapshotId, snapPath, node)
+	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+func (cs *ControllerServer) ListSnapshots(_ context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+	all := cs.provisioner.SnapshotTracker().List(req.SnapshotId, req.SourceVolumeId)
+
+	// Pagination: StartingToken is the index into the sorted list.
+	start := 0
+	if req.StartingToken != "" {
+		n, err := strconv.Atoi(req.StartingToken)
+		if err != nil || n < 0 || n > len(all) {
+			return nil, status.Errorf(codes.Aborted, "invalid starting_token %q", req.StartingToken)
+		}
+		start = n
+	}
+	end := len(all)
+	if req.MaxEntries > 0 && start+int(req.MaxEntries) < end {
+		end = start + int(req.MaxEntries)
+	}
+	entries := make([]*csi.ListSnapshotsResponse_Entry, 0, end-start)
+	for _, s := range all[start:end] {
+		entries = append(entries, &csi.ListSnapshotsResponse_Entry{Snapshot: toCSISnapshot(s)})
+	}
+	resp := &csi.ListSnapshotsResponse{Entries: entries}
+	if end < len(all) {
+		resp.NextToken = strconv.Itoa(end)
+	}
+	return resp, nil
+}
+
+func toCSISnapshot(s lpp.SnapshotInfo) *csi.Snapshot {
+	return &csi.Snapshot{
+		SnapshotId:     s.SnapshotID,
+		SourceVolumeId: s.SourceVolumeID,
+		SizeBytes:      s.SizeBytes,
+		CreationTime:   timestamppb.New(s.CreationTime),
+		ReadyToUse:     s.ReadyToUse,
+	}
 }
 
 // validateCapabilities rejects unsupported access modes early.

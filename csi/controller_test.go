@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
@@ -532,31 +533,23 @@ func TestControllerServer_ControllerGetCapabilities(t *testing.T) {
 	for _, c := range resp.Capabilities {
 		have[c.GetRpc().Type] = true
 	}
-	// CREATE_DELETE_VOLUME + EXPAND_VOLUME + GET_CAPACITY are wired.
-	// CREATE_DELETE_SNAPSHOT/LIST_SNAPSHOTS land in M7.
+	// All wired: CREATE_DELETE_VOLUME, EXPAND_VOLUME, GET_CAPACITY,
+	// CREATE_DELETE_SNAPSHOT, LIST_SNAPSHOTS.
 	assert.True(t, have[csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME])
 	assert.True(t, have[csi.ControllerServiceCapability_RPC_EXPAND_VOLUME])
 	assert.True(t, have[csi.ControllerServiceCapability_RPC_GET_CAPACITY])
-	assert.False(t, have[csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT])
+	assert.True(t, have[csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT])
+	assert.True(t, have[csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS])
 }
 
-func TestControllerServer_PendingMilestones_ReturnUnimplemented(t *testing.T) {
-	cs := NewControllerServer(nil)
-	cases := []func() error{
-		func() error {
-			_, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{})
-			return err
-		},
-		func() error {
-			_, err := cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{})
-			return err
-		},
-		func() error { _, err := cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{}); return err },
-	}
-	for i, fn := range cases {
-		err := fn()
-		assert.Equal(t, codes.Unimplemented, status.Code(err), "case %d", i)
-	}
+func TestControllerServer_SnapshotRPCs_ArgValidation(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	_, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "s"})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = f.cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 func TestControllerServer_ControllerPublishUnpublish_Noop(t *testing.T) {
@@ -586,6 +579,218 @@ func TestPickPreferredNode(t *testing.T) {
 		Preferred: []*csi.Topology{{Segments: map[string]string{"other-key": "x"}}},
 	})
 	assert.Equal(t, "", got)
+}
+
+// makeCSIPVWithQuota is like makeCSIPV but stamps a quotaType attribute.
+func makeCSIPVWithQuota(name, node, path, size, quotaType string) *v1.PersistentVolume {
+	pv := makeCSIPV(name, node, path, size, v1.PersistentVolumeReclaimDelete)
+	pv.Spec.PersistentVolumeSource.CSI.VolumeAttributes[VolumeContextQuotaType] = quotaType
+	return pv
+}
+
+func TestControllerServer_CreateSnapshot_HappyPath(t *testing.T) {
+	pv := makeCSIPVWithQuota("pv-src", "n1", "/data/pv-src", "2Gi", "btrfs")
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	resp, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+		Name:           "snap-1",
+		SourceVolumeId: "pv-src",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.Snapshot)
+	assert.Equal(t, "pv-src/snap-1", resp.Snapshot.SnapshotId)
+	assert.Equal(t, "pv-src", resp.Snapshot.SourceVolumeId)
+	assert.Equal(t, int64(2)<<30, resp.Snapshot.SizeBytes)
+	assert.True(t, resp.Snapshot.ReadyToUse)
+
+	calls := f.calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, lpp.ActionTypeSnapshot, calls[0].Type)
+	assert.Equal(t, "/data/pv-src", calls[0].Volume.Path)
+	assert.Equal(t, "/data/.snapshots/snap-1", calls[0].Volume.SnapDir)
+	assert.Equal(t, "n1", calls[0].Volume.Node)
+
+	// In the tracker now.
+	info, ok := f.prov.SnapshotTracker().Get("pv-src/snap-1")
+	require.True(t, ok)
+	assert.Equal(t, "/data/.snapshots/snap-1", info.SnapshotPath)
+	assert.Equal(t, "btrfs", info.QuotaType)
+}
+
+func TestControllerServer_CreateSnapshot_Idempotent(t *testing.T) {
+	pv := makeCSIPV("pv-src", "n1", "/data/pv-src", "2Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	_, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "pv-src"})
+	require.NoError(t, err)
+	resp, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "pv-src"})
+	require.NoError(t, err)
+	assert.Equal(t, "pv-src/snap-1", resp.Snapshot.SnapshotId)
+	assert.Len(t, f.calls(), 1, "idempotent CreateSnapshot must not re-run the helper")
+}
+
+func TestControllerServer_CreateSnapshot_SameNameDifferentSource_AlreadyExists(t *testing.T) {
+	pvA := makeCSIPV("pv-a", "n1", "/data/pv-a", "1Gi", v1.PersistentVolumeReclaimDelete)
+	pvB := makeCSIPV("pv-b", "n1", "/data/pv-b", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pvA, pvB)
+	// CSI spec: snapshot names are globally unique. Create "snap" of pv-a,
+	// then "snap" of pv-b must fail with AlreadyExists.
+	_, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap", SourceVolumeId: "pv-a"})
+	require.NoError(t, err)
+	_, err = f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap", SourceVolumeId: "pv-b"})
+	require.Error(t, err)
+	assert.Equal(t, codes.AlreadyExists, status.Code(err))
+}
+
+func TestControllerServer_CreateSnapshot_MissingSourcePV(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	_, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "s", SourceVolumeId: "ghost"})
+	require.Error(t, err)
+	assert.Equal(t, codes.NotFound, status.Code(err))
+}
+
+func TestControllerServer_CreateSnapshot_FilesystemUnsupported(t *testing.T) {
+	pv := makeCSIPV("pv-ext4", "n1", "/data/pv-ext4", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	f.prov.SetRunHelperPodFn(func(_ context.Context, _ lpp.HelperAction) error {
+		return assertableError("snapshots not supported on filesystem ext4")
+	})
+	_, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "s", SourceVolumeId: "pv-ext4"})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+func TestControllerServer_DeleteSnapshot_FromTracker(t *testing.T) {
+	pv := makeCSIPV("pv-src", "n1", "/data/pv-src", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	_, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "s", SourceVolumeId: "pv-src"})
+	require.NoError(t, err)
+
+	_, err = f.cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "pv-src/s"})
+	require.NoError(t, err)
+	calls := f.calls()
+	// 1 snapshot + 1 delete-snapshot.
+	require.Len(t, calls, 2)
+	assert.Equal(t, lpp.ActionTypeDeleteSnapshot, calls[1].Type)
+	assert.Equal(t, "/data/.snapshots/s", calls[1].Volume.SnapDir)
+	_, ok := f.prov.SnapshotTracker().Get("pv-src/s")
+	assert.False(t, ok, "deleted snapshot must be removed from the tracker")
+}
+
+func TestControllerServer_DeleteSnapshot_FromSourcePV_AfterRestart(t *testing.T) {
+	// Tracker is empty (simulating a controller restart), but the source PV
+	// still exists, so DeleteSnapshot re-derives the path.
+	pv := makeCSIPV("pv-src", "n1", "/data/pv-src", "1Gi", v1.PersistentVolumeReclaimDelete)
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	_, err := f.cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "pv-src/orphan"})
+	require.NoError(t, err)
+	calls := f.calls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, lpp.ActionTypeDeleteSnapshot, calls[0].Type)
+	assert.Equal(t, "/data/.snapshots/orphan", calls[0].Volume.SnapDir)
+}
+
+func TestControllerServer_DeleteSnapshot_Idempotent(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	// Unrecognized ID → idempotent success.
+	_, err := f.cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "no-slash"})
+	require.NoError(t, err)
+	// Recognized ID but source PV gone and not in tracker → idempotent success.
+	_, err = f.cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "ghost-pv/snap"})
+	require.NoError(t, err)
+	assert.Empty(t, f.calls())
+}
+
+func TestControllerServer_ListSnapshots(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	now := time.Now()
+	for _, s := range []lpp.SnapshotInfo{
+		{SnapshotID: "pv-a/s1", SourceVolumeID: "pv-a", SizeBytes: 1, CreationTime: now, ReadyToUse: true},
+		{SnapshotID: "pv-a/s2", SourceVolumeID: "pv-a", SizeBytes: 2, CreationTime: now, ReadyToUse: true},
+		{SnapshotID: "pv-b/s1", SourceVolumeID: "pv-b", SizeBytes: 3, CreationTime: now, ReadyToUse: true},
+	} {
+		f.prov.SnapshotTracker().Put(s)
+	}
+
+	// All.
+	resp, err := f.cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{})
+	require.NoError(t, err)
+	assert.Len(t, resp.Entries, 3)
+	assert.Empty(t, resp.NextToken)
+
+	// By snapshot ID.
+	resp, err = f.cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{SnapshotId: "pv-a/s2"})
+	require.NoError(t, err)
+	require.Len(t, resp.Entries, 1)
+	assert.Equal(t, "pv-a/s2", resp.Entries[0].Snapshot.SnapshotId)
+
+	// By source volume.
+	resp, err = f.cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{SourceVolumeId: "pv-a"})
+	require.NoError(t, err)
+	assert.Len(t, resp.Entries, 2)
+
+	// Pagination.
+	resp, err = f.cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{MaxEntries: 2})
+	require.NoError(t, err)
+	assert.Len(t, resp.Entries, 2)
+	require.Equal(t, "2", resp.NextToken)
+	resp, err = f.cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{StartingToken: "2"})
+	require.NoError(t, err)
+	assert.Len(t, resp.Entries, 1)
+	assert.Empty(t, resp.NextToken)
+
+	// Bad token.
+	_, err = f.cs.ListSnapshots(context.Background(), &csi.ListSnapshotsRequest{StartingToken: "nope"})
+	require.Error(t, err)
+	assert.Equal(t, codes.Aborted, status.Code(err))
+}
+
+func TestControllerServer_CreateVolume_FromSnapshot(t *testing.T) {
+	pv := makeCSIPVWithQuota("pv-src", "n1", "/data/pv-src", "1Gi", "btrfs")
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`, pv)
+	_, err := f.cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "pv-src"})
+	require.NoError(t, err)
+
+	req := validCreateReq("pv-restored", 1<<30, "n1")
+	req.VolumeContentSource = &csi.VolumeContentSource{
+		Type: &csi.VolumeContentSource_Snapshot{Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "pv-src/snap-1"}},
+	}
+	resp, err := f.cs.CreateVolume(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, resp.Volume.ContentSource)
+	assert.Equal(t, "pv-src/snap-1", resp.Volume.ContentSource.GetSnapshot().GetSnapshotId())
+
+	calls := f.calls()
+	// snapshot + restore.
+	require.Len(t, calls, 2)
+	assert.Equal(t, lpp.ActionTypeRestore, calls[1].Type)
+	assert.Equal(t, "/data/.snapshots/snap-1", calls[1].Volume.SnapDir)
+	assert.Equal(t, "btrfs", calls[1].Volume.QuotaType, "restored volume inherits the snapshot's quota type when none requested")
+}
+
+func TestControllerServer_CreateVolume_FromSnapshot_NotFound(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]}]}`)
+	req := validCreateReq("pv-restored", 1<<30, "n1")
+	req.VolumeContentSource = &csi.VolumeContentSource{
+		Type: &csi.VolumeContentSource_Snapshot{Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "ghost/snap"}},
+	}
+	_, err := f.cs.CreateVolume(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.NotFound, status.Code(err))
+}
+
+func TestControllerServer_CreateVolume_FromSnapshot_WrongNode(t *testing.T) {
+	f := newFixture(t, `{"nodePathMap":[{"node":"n1","paths":["/data"]},{"node":"n2","paths":["/data"]}]}`)
+	f.prov.SnapshotTracker().Put(lpp.SnapshotInfo{
+		SnapshotID: "pv-src/snap", SourceVolumeID: "pv-src", Node: "n1",
+		SnapshotPath: "/data/.snapshots/snap", ReadyToUse: true,
+	})
+	// Pod scheduled to n2, but the snapshot is on n1.
+	req := validCreateReq("pv-restored", 1<<30, "n2")
+	req.VolumeContentSource = &csi.VolumeContentSource{
+		Type: &csi.VolumeContentSource_Snapshot{Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: "pv-src/snap"}},
+	}
+	_, err := f.cs.CreateVolume(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, codes.ResourceExhausted, status.Code(err))
 }
 
 // makeCSIPV builds a CSI-style PV the way our controller emits one.

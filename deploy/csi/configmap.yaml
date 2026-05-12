@@ -19,7 +19,9 @@ data:
       ],
       "setupCommand": "/opt/local-path-provisioner/setup.sh",
       "teardownCommand": "/opt/local-path-provisioner/teardown.sh",
-      "resizeCommand": "/opt/local-path-provisioner/resize.sh"
+      "resizeCommand": "/opt/local-path-provisioner/resize.sh",
+      "snapshotCommand": "/opt/local-path-provisioner/snapshot.sh",
+      "restoreCommand": "/opt/local-path-provisioner/restore.sh"
     }
   helperPod.yaml: |
     apiVersion: v1

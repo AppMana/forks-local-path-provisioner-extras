@@ -1,0 +1,12 @@
+# Requires the external-snapshotter CRDs (VolumeSnapshot, VolumeSnapshotContent,
+# VolumeSnapshotClass) and the snapshot-controller to be installed cluster-wide.
+# They are NOT part of this driver — install once per cluster from
+# https://github.com/kubernetes-csi/external-snapshotter (config/crd + the
+# snapshot-controller deployment). Without them the csi-snapshotter sidecar in
+# the controller Deployment will not start.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: local-path-csi
+driver: local-path.appmana.io
+deletionPolicy: Delete

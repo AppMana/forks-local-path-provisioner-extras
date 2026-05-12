@@ -125,3 +125,51 @@ free_project_id() {
         rm -f /tmp/.lpp_projects
     ) 9>"$QUOTA_LOCKFILE"
 }
+
+# apply_quota applies a per-filesystem hard byte quota to an existing volume
+# directory. Args: $1 = volume dir, $2 = size in bytes, $3 = quota type
+# (xfs|ext4|btrfs|none). Used by setup.sh and restore.sh so the two paths
+# stay in lockstep.
+apply_quota() {
+    _voldir=$1; _size=$2; _qtype=$3
+    _parent=$(dirname "$_voldir")
+    _name=$(basename "$_voldir")
+    case "$_qtype" in
+    none|"")
+        log "no quota enforcement for $_voldir"
+        ;;
+    xfs)
+        command -v xfs_quota >/dev/null 2>&1 || die "xfs_quota not found (install xfsprogs)"
+        require_mount_option "$_parent" prjquota
+        _pid=$(alloc_project_id "$_voldir" "$_name")
+        log "xfs: project $_name id $_pid, bhard=$_size bytes"
+        xfs_quota -x -c "project -s $_name" "$_parent"
+        xfs_quota -x -c "limit -p bhard=$_size $_name" "$_parent"
+        xfs_quota -x -c "report -pbih" "$_parent" || true
+        ;;
+    ext4)
+        command -v setquota >/dev/null 2>&1 || die "setquota not found (install quota)"
+        command -v chattr   >/dev/null 2>&1 || die "chattr not found (install e2fsprogs)"
+        require_mount_option "$_parent" prjquota
+        _mp=$(resolve_mountpoint "$_parent")
+        _pid=$(alloc_project_id "$_voldir" "$_name")
+        log "ext4: project $_name id $_pid on $_mp, hard=$_size bytes"
+        chattr +P -p "$_pid" "$_voldir"
+        _blocks=$(( (_size + 1023) / 1024 ))
+        setquota -P "$_pid" 0 "$_blocks" 0 0 "$_mp"
+        repquota -P "$_mp" 2>/dev/null | grep -E "^#?$_pid" || true
+        ;;
+    btrfs)
+        command -v btrfs >/dev/null 2>&1 || die "btrfs not found (install btrfs-progs)"
+        _mp=$(resolve_mountpoint "$_parent")
+        btrfs quota enable "$_mp" 2>/dev/null || true
+        btrfs quota rescan -w "$_mp" >/dev/null 2>&1 || true
+        log "btrfs: subvolume $_voldir qgroup limit $_size bytes"
+        btrfs qgroup limit "$_size" "$_voldir"
+        btrfs qgroup show -re "$_voldir" 2>/dev/null || true
+        ;;
+    *)
+        die "unhandled quota type: $_qtype"
+        ;;
+    esac
+}

@@ -12,6 +12,8 @@ SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop';
 
 RUN Install-WindowsFeature -Name FS-FileServer, FS-Resource-Manager -IncludeManagementTools
 
-COPY scripts\common.ps1 scripts\setup.ps1 scripts\teardown.ps1 scripts\resize.ps1 C:/opt/local-path-provisioner/
+COPY scripts\common.ps1 scripts\setup.ps1 scripts\teardown.ps1 scripts\resize.ps1 `
+     scripts\snapshot.ps1 scripts\restore.ps1 `
+     C:/opt/local-path-provisioner/
 
 WORKDIR C:/opt/local-path-provisioner

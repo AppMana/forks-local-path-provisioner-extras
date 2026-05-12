@@ -26,10 +26,12 @@ import (
 type ActionType string
 
 const (
-	ActionTypeCreate   ActionType = "create"
-	ActionTypeDelete   ActionType = "delete"
-	ActionTypeResize   ActionType = "resize"
-	ActionTypeSnapshot ActionType = "snapshot"
+	ActionTypeCreate         ActionType = "create"
+	ActionTypeDelete         ActionType = "delete"
+	ActionTypeResize         ActionType = "resize"
+	ActionTypeSnapshot       ActionType = "snapshot"
+	ActionTypeDeleteSnapshot ActionType = "delete-snapshot"
+	ActionTypeRestore        ActionType = "restore"
 )
 
 const (
@@ -59,6 +61,7 @@ type Provisioner struct {
 	configMutex     *sync.RWMutex
 	helperPod       *v1.Pod
 	capacityTracker *CapacityTracker
+	snapshotTracker *SnapshotTracker
 
 	// runHelperPodFn is the helper-pod dispatch hook. nil means "use the
 	// real implementation". Tests inject a fake via SetRunHelperPodFn.
@@ -89,6 +92,7 @@ func NewProvisioner(
 		configMapName:      configMapName,
 		configMutex:        &sync.RWMutex{},
 		capacityTracker:    NewCapacityTracker(),
+		snapshotTracker:    NewSnapshotTracker(),
 	}
 	var err error
 	p.helperPod, err = LoadHelperPodFile(helperPodYaml)
@@ -144,6 +148,29 @@ func (p *Provisioner) ResizeCommand() []string {
 	}
 	return []string{"/bin/sh", "/script/resize"}
 }
+
+// SnapshotCommand returns the configured snapshot command, or the default.
+func (p *Provisioner) SnapshotCommand() []string {
+	p.configMutex.RLock()
+	defer p.configMutex.RUnlock()
+	if p.config != nil && p.config.SnapshotCommand != "" {
+		return []string{p.config.SnapshotCommand}
+	}
+	return []string{"/opt/local-path-provisioner/snapshot.sh"}
+}
+
+// RestoreCommand returns the configured restore command, or the default.
+func (p *Provisioner) RestoreCommand() []string {
+	p.configMutex.RLock()
+	defer p.configMutex.RUnlock()
+	if p.config != nil && p.config.RestoreCommand != "" {
+		return []string{p.config.RestoreCommand}
+	}
+	return []string{"/opt/local-path-provisioner/restore.sh"}
+}
+
+// SnapshotTracker exposes the in-memory snapshot index.
+func (p *Provisioner) SnapshotTracker() *SnapshotTracker { return p.snapshotTracker }
 
 func (p *Provisioner) refreshConfig() error {
 	p.configMutex.Lock()
@@ -339,6 +366,10 @@ type VolumeOptions struct {
 	SizeInBytes int64
 	Node        string
 	QuotaType   string
+	// SnapDir, when non-empty, is the snapshot directory the snapshot /
+	// restore actions operate on. For ActionTypeSnapshot it is the
+	// destination; for ActionTypeRestore it is the source.
+	SnapDir string
 }
 
 // HelperAction bundles the args for a single helper-pod invocation.
@@ -421,6 +452,9 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 		{Name: envVolMode, Value: string(o.Mode)},
 		{Name: envVolSize, Value: strconv.FormatInt(o.SizeInBytes, 10)},
 		{Name: envVolQuotaType, Value: o.QuotaType},
+	}
+	if o.SnapDir != "" {
+		env = append(env, v1.EnvVar{Name: envSnapDir, Value: o.SnapDir})
 	}
 
 	helperPod.Name = helperPod.Name + "-" + string(a.Type) + "-" + o.Name

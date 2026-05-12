@@ -16,6 +16,7 @@ const (
 	envVolMode      = "VOL_MODE"
 	envVolSize      = "VOL_SIZE_BYTES"
 	envVolQuotaType = "VOL_QUOTA_TYPE"
+	envSnapDir      = "SNAP_DIR"
 
 	helperScriptDir     = "/script"
 	helperDataVolName   = "data"
@@ -76,6 +77,8 @@ type ConfigData struct {
 	SetupCommand      string `json:"setupCommand,omitempty"`
 	TeardownCommand   string `json:"teardownCommand,omitempty"`
 	ResizeCommand     string `json:"resizeCommand,omitempty"`
+	SnapshotCommand   string `json:"snapshotCommand,omitempty"`
+	RestoreCommand    string `json:"restoreCommand,omitempty"`
 	StorageClassConfigData
 	StorageClassConfigs map[string]StorageClassConfigData `json:"storageClassConfigs"`
 }
@@ -100,6 +103,8 @@ type Config struct {
 	SetupCommand      string
 	TeardownCommand   string
 	ResizeCommand     string
+	SnapshotCommand   string
+	RestoreCommand    string
 	StorageClassConfig
 	StorageClassConfigs map[string]StorageClassConfig
 }

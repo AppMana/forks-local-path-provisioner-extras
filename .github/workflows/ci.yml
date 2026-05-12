@@ -68,6 +68,30 @@ jobs:
       - name: csi-sanity (-tags=sanity)
         run: go test -tags=sanity -count=1 -timeout=300s -v ./csi/...
 
+  helper-scripts-lint:
+    name: helper-image script lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: sh -n
+        run: |
+          for f in package/helper-image/scripts/*.sh; do
+            sh -n "$f" && echo "OK  $f"
+          done
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: package/helper-image/scripts
+          additional_files: common.sh
+          severity: warning
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path package/helper-image/scripts -Recurse -Severity Warning,Error
+          $issues | Format-Table -AutoSize
+          if ($issues | Where-Object Severity -eq 'Error') { exit 1 }
+
   cross-build:
     name: cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-24.04

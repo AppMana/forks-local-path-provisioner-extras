@@ -1,0 +1,70 @@
+name: helper-image
+
+on:
+  push:
+    branches: [appmana-extras, master, main]
+    paths:
+      - 'package/helper-image/**'
+      - '.github/workflows/helper-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository_owner }}/local-path-helper
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: package/helper-image
+          file: package/helper-image/linux.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE }}:linux-${{ github.sha }}
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: login
+        shell: pwsh
+        run: docker login ${{ env.REGISTRY }} -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+      - name: build & push
+        shell: pwsh
+        run: |
+          docker build `
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE }}:windows-${{ github.sha }} `
+            -f package/helper-image/windows.Dockerfile `
+            --build-arg WINRELEASE=ltsc2022 `
+            package/helper-image
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE }}:windows-${{ github.sha }}
+
+  manifest:
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: imjasonh/setup-crane@v0.4
+      - name: combine into a multi-platform manifest list
+        run: |
+          crane auth login ${{ env.REGISTRY }} -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+          crane index append \
+            -m ${{ env.REGISTRY }}/${{ env.IMAGE }}:linux-${{ github.sha }} \
+            -m ${{ env.REGISTRY }}/${{ env.IMAGE }}:windows-${{ github.sha }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.sha }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest
+          echo "Pushed ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.sha }} (+ :latest)"

@@ -266,17 +266,32 @@ The CSI driver reconstructs `SnapshotContent` state from these files on restart 
 
 ### 5.6 Helper image
 
-Built in this fork via GitHub Actions. Layout:
+Built in this fork via GitHub Actions. **Implemented (M5).** Layout:
 
 ```
 package/helper-image/
-  linux.Dockerfile
-  windows.Dockerfile
+  linux.Dockerfile          # debian-bookworm-slim + xfsprogs quota e2fsprogs btrfs-progs util-linux coreutils
+  windows.Dockerfile        # servercore-ltsc2022 + FS-Resource-Manager feature
   scripts/
-    common.sh
-    setup-linux.sh, teardown-linux.sh, resize-linux.sh, snapshot-linux.sh, restore-linux.sh
-    setup-windows.ps1, teardown-windows.ps1, resize-windows.ps1, snapshot-windows.ps1, restore-windows.ps1
+    common.sh   setup.sh   teardown.sh   resize.sh    # Linux: xfs/ext4/btrfs branches (snapshot.sh/restore.sh in M7/M8)
+    common.ps1  setup.ps1  teardown.ps1  resize.ps1   # Windows: NTFS/ReFS via FSRM (skeleton; full impl M6)
 ```
+
+**Scripts live as files in the image, not as ConfigMap blobs.** `config.json`
+sets `setupCommand`/`teardownCommand`/`resizeCommand` to
+`/opt/local-path-provisioner/{setup,teardown,resize}.sh`, so the provisioner
+runs the image-baked scripts directly (it only mounts the ConfigMap script
+keys when those commands are unset — a fallback path that still works). The
+ConfigMap carries `config.json` + `helperPod.yaml`; the helperPod template is
+`privileged: true` with hostPath mounts of `/etc/projects`, `/etc/projid`,
+`/dev`, `/var/lock` for the xfs/ext4 project-quota branches.
+
+The Linux scripts detect the filesystem with `findmnt -no FSTYPE --target`
+(not `stat -f -c %T`, which reports ext4 as `ext2/ext3`):
+- **xfs**: requires the `prjquota`/`pquota` mount option; `xfs_quota -x -c 'limit -p bhard=N <name>'`. Project ID allocated under `flock` into `/etc/projects` + `/etc/projid`.
+- **ext4**: requires `prjquota` (mkfs.ext4 `-O quota,project`); `chattr +P -p <id>` binds the dir tree to the project; `setquota -P <id> 0 <KiB-blocks> 0 0 <mp>`. Shares the `/etc/projid` ID pool + lockfile with xfs.
+- **btrfs**: the volume dir is a `btrfs subvolume create` (not `mkdir`); `btrfs quota enable <mp>` once (idempotent); `btrfs qgroup limit N <voldir>`. Teardown is `btrfs subvolume delete` (drops the qgroup with it).
+- **none / unsupported FS under `auto`**: `mkdir -m 0777 -p`, no enforcement, logged.
 
 **linux.Dockerfile** (multi-arch via buildx, `linux/amd64,linux/arm64`):
 

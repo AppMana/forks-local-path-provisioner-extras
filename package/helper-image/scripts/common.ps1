@@ -1,18 +1,26 @@
-# common.ps1 — shared helpers for the Windows local-path helper scripts.
+# common.ps1 - shared helpers for the Windows local-path helper scripts.
 #
-# Sourced (. C:\opt\local-path-provisioner\common.ps1) by setup/teardown/resize.
+# Sourced (. C:\opt\local-path-provisioner\common.ps1) by setup/teardown/
+# resize/snapshot/restore.
 #
-# Env vars from the CSI controller: VOL_DIR VOL_SIZE_BYTES VOL_MODE VOL_QUOTA_TYPE
-#
-# NOTE: full FSRM enforcement is wired in M6. These helpers are the skeleton.
+# Env vars from the CSI controller: VOL_DIR VOL_SIZE_BYTES VOL_MODE
+# VOL_QUOTA_TYPE [SNAP_DIR]
 
 $ErrorActionPreference = 'Stop'
 
+# Write-Log writes a timestamped line to STDERR. It must not go to stdout
+# because PowerShell folds all pipeline output into a function's return value
+# (Resolve-QuotaType etc. would be corrupted by a stray log line). The kubelet
+# merges the helper pod's stdout+stderr into the container log, so the
+# controller still sees these lines.
 function Write-Log([string]$msg) {
-    Write-Output ("{0} {1}" -f (Get-Date -Format o), $msg)
+    $line = ((Get-Date -Format o).ToString()) + ' ' + $msg
+    [Console]::Error.WriteLine($line)
 }
 
-function Throw-Die([string]$msg) {
+# Die logs an error and exits non-zero. Not named Verb-Noun on purpose so
+# PSScriptAnalyzer's PSUseApprovedVerbs rule leaves it alone.
+function Die([string]$msg) {
     Write-Log "ERROR: $msg"
     exit 1
 }
@@ -20,11 +28,18 @@ function Throw-Die([string]$msg) {
 # Resolve-FsType returns 'NTFS', 'ReFS', or the raw FileSystemType for the
 # volume holding $Path.
 function Resolve-FsType([string]$Path) {
+    try { return (Get-Volume -FilePath $Path).FileSystemType }
+    catch { return 'unknown' }
+}
+
+# Resolve-VolumeDriveLetter returns the drive letter (e.g. 'D') for the volume
+# holding $Path, or '' if it can't be determined.
+function Resolve-VolumeDriveLetter([string]$Path) {
     try {
-        return (Get-Volume -FilePath $Path).FileSystemType
-    } catch {
-        return 'unknown'
-    }
+        $dl = (Get-Volume -FilePath $Path).DriveLetter
+        if ($dl) { return [string]$dl }
+        return ''
+    } catch { return '' }
 }
 
 # Resolve-QuotaType maps $env:VOL_QUOTA_TYPE to a concrete type, auto-detecting
@@ -37,9 +52,9 @@ function Resolve-QuotaType([string]$Path) {
         ''      { return 'none' }
         'ntfs'  { return 'ntfs' }
         'refs'  { return 'refs' }
-        'xfs'   { Throw-Die "quota type xfs requested on a Windows node" }
-        'ext4'  { Throw-Die "quota type ext4 requested on a Windows node" }
-        'btrfs' { Throw-Die "quota type btrfs requested on a Windows node" }
+        'xfs'   { Die "quota type xfs requested on a Windows node" }
+        'ext4'  { Die "quota type ext4 requested on a Windows node" }
+        'btrfs' { Die "quota type btrfs requested on a Windows node" }
         'auto'  {
             $fs = Resolve-FsType $Path
             switch ($fs) {
@@ -51,16 +66,41 @@ function Resolve-QuotaType([string]$Path) {
                 }
             }
         }
-        default { Throw-Die "unknown VOL_QUOTA_TYPE: $requested" }
+        default { Die "unknown VOL_QUOTA_TYPE: $requested" }
     }
 }
 
-# Ensure-FsrmAvailable verifies the FileServerResourceManager module is present
+# Assert-FsrmAvailable verifies the FileServerResourceManager module is present
 # (it ships with the FS-Resource-Manager Windows feature, installed in the
-# servercore-based helper image).
-function Ensure-FsrmAvailable {
+# servercore-based helper image) and imports it.
+function Assert-FsrmAvailable {
     if (-not (Get-Module -ListAvailable -Name FileServerResourceManager)) {
-        Throw-Die "FileServerResourceManager module not available; the helper image must include the FS-Resource-Manager feature"
+        Die "FileServerResourceManager module not available; the helper image must include the FS-Resource-Manager feature"
     }
     Import-Module FileServerResourceManager -ErrorAction Stop
+}
+
+# Set-FsrmHardQuota creates or updates an FSRM hard byte quota on $Path. Hard
+# quotas reject writes that would exceed the limit (the default FSRM template
+# behavior with -SoftLimit:$false, which is the New-FsrmQuota default).
+function Set-FsrmHardQuota([string]$Path, [int64]$SizeBytes) {
+    Assert-FsrmAvailable
+    try {
+        $existing = Get-FsrmQuota -Path $Path -ErrorAction SilentlyContinue
+        if ($existing) {
+            Set-FsrmQuota -Path $Path -Size $SizeBytes -ErrorAction Stop | Out-Null
+        } else {
+            New-FsrmQuota -Path $Path -Size $SizeBytes -Description "local-path-provisioner" -ErrorAction Stop | Out-Null
+        }
+        Get-FsrmQuota -Path $Path | Format-List Path, Size, Usage
+    } catch {
+        Die "FSRM quota operation failed for $Path : $($_.Exception.Message)"
+    }
+}
+
+# Remove-FsrmHardQuota removes any FSRM quota at $Path. Best-effort.
+function Remove-FsrmHardQuota([string]$Path) {
+    if (-not (Get-Module -ListAvailable -Name FileServerResourceManager)) { return }
+    Import-Module FileServerResourceManager -ErrorAction SilentlyContinue
+    Get-FsrmQuota -Path $Path -ErrorAction SilentlyContinue | Remove-FsrmQuota -Confirm:$false -ErrorAction SilentlyContinue
 }

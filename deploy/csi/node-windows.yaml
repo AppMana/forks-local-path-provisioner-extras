@@ -1,0 +1,72 @@
+# Windows CSI node plugin DaemonSet.
+#
+# Runs as a HostProcess container (Kubernetes >= 1.23 GA): the driver and the
+# node-driver-registrar execute as host processes with direct access to the
+# node filesystem, so csi-proxy is NOT required. The host must have the
+# HostProcess containers feature enabled (it is by default on supported
+# kubelet versions).
+#
+# STATUS: best-effort based on the sig-windows CSI conventions; the helper-pod
+# quota scripts (package/helper-image/scripts/*.ps1) and the driver binary are
+# validated independently, but the full kubelet<->plugin registration path on
+# Windows should be confirmed on a real Windows cluster before relying on it.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: local-path-csi-node-windows
+  namespace: local-path-storage
+  labels:
+    app: local-path-csi-node-windows
+spec:
+  selector:
+    matchLabels:
+      app: local-path-csi-node-windows
+  template:
+    metadata:
+      labels:
+        app: local-path-csi-node-windows
+    spec:
+      serviceAccountName: local-path-csi-node
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: windows
+      tolerations:
+        - operator: Exists
+      securityContext:
+        windowsOptions:
+          hostProcess: true
+          runAsUserName: "NT AUTHORITY\\SYSTEM"
+      hostNetwork: true
+      containers:
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+          command:
+            - "$env:CONTAINER_SANDBOX_MOUNT_POINT/csi-node-driver-registrar.exe"
+          args:
+            - --csi-address=unix://C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.io\\csi.sock
+            - --kubelet-registration-path=C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.io\\csi.sock
+            - --plugin-registration-path=C:\\var\\lib\\kubelet\\plugins_registry
+            - --v=2
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+        - name: local-path-csi
+          image: ghcr.io/appmana/local-path-csi:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - "$env:CONTAINER_SANDBOX_MOUNT_POINT/local-path-csi.exe"
+          args:
+            - --mode=node
+            - --csi-endpoint=unix://C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.io\\csi.sock
+            - --namespace=$(POD_NAMESPACE)
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace

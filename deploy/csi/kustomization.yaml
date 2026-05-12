@@ -5,7 +5,8 @@ resources:
   - configmap.yaml
   - csidriver.yaml
   - controller.yaml
-  - node.yaml
+  - node.yaml          # Linux node plugin DaemonSet (nodeSelector os=linux)
+  - node-windows.yaml  # Windows node plugin DaemonSet (HostProcess; nodeSelector os=windows)
   - storageclass.yaml
   # Requires the external-snapshotter CRDs + snapshot-controller installed
   # cluster-wide (see volumesnapshotclass.yaml). The controller Deployment's

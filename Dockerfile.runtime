@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.7.0
+#
+# Minimal runtime image for the local-path CSI driver (Linux). The repo's
+# top-level Dockerfile keeps the dapper-style build/test/validate stages for
+# CI; this one is the lean image users actually deploy. Built multi-arch
+# (linux/amd64, linux/arm64) by .github/workflows/driver-image.yml.
+FROM --platform=$BUILDPLATFORM golang:1.26.2-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -mod=vendor -trimpath -ldflags="-s -w -X main.VERSION=${VERSION}" \
+    -o /out/local-path-csi .
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build /out/local-path-csi /local-path-csi
+USER 65532:65532
+ENTRYPOINT ["/local-path-csi"]

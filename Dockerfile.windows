@@ -1,0 +1,13 @@
+# escape=`
+#
+# Windows runtime image for the local-path CSI driver. nanoserver is enough —
+# the driver is a static Go binary, and the Windows node DaemonSet runs it as a
+# HostProcess container (so it has host filesystem access without csi-proxy).
+#
+# The build context must contain a pre-built local-path-csi.exe (windows/amd64);
+# .github/workflows/driver-image.yml cross-compiles it on the Linux job and the
+# Windows job downloads the artifact before `docker build`.
+ARG WINRELEASE=ltsc2022
+FROM mcr.microsoft.com/windows/nanoserver:${WINRELEASE}
+COPY local-path-csi.exe C:/local-path-csi.exe
+ENTRYPOINT ["C:\\local-path-csi.exe"]

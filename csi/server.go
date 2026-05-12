@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -46,6 +47,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	if scheme == "unix" {
+		// The parent dir may not exist yet (e.g. a Windows HostProcess node
+		// plugin pointed at C:\var\lib\kubelet\plugins\<driver>\csi.sock).
+		if dir := filepath.Dir(addr); dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0o755)
+		}
 		_ = os.Remove(addr)
 	}
 	lis, err := net.Listen(scheme, addr)

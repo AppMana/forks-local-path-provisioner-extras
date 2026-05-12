@@ -17,6 +17,8 @@ spec:
       serviceAccountName: local-path-csi-node
       priorityClassName: system-node-critical
       hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: linux
       tolerations:
         - operator: Exists
       containers:

@@ -17,9 +17,12 @@ PROJECTS_FILE=/etc/projects
 PROJID_FILE=/etc/projid
 QUOTA_LOCKFILE=/var/lock/local-path-quota.lock
 
-# log writes a timestamped line to stdout. The controller scrapes helper-pod
-# logs into its own log stream.
-log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+# log writes a timestamped line to STDERR. It must not go to stdout because
+# several helpers (resolve_quota_type, alloc_project_id, ...) return their
+# value via stdout and the caller does `x=$(helper ...)` — stdout logging
+# would corrupt the captured value. The kubelet merges the helper pod's
+# stdout+stderr into the container log, so the controller still sees these.
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 
 die() { log "ERROR: $*"; exit 1; }
 

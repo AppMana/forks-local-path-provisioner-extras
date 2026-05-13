@@ -17,11 +17,11 @@ data:
           "paths": ["/opt/local-path-provisioner"]
         }
       ],
-      "setupCommand": "/opt/local-path-provisioner/setup.sh",
-      "teardownCommand": "/opt/local-path-provisioner/teardown.sh",
-      "resizeCommand": "/opt/local-path-provisioner/resize.sh",
-      "snapshotCommand": "/opt/local-path-provisioner/snapshot.sh",
-      "restoreCommand": "/opt/local-path-provisioner/restore.sh"
+      "setupCommand": "/usr/local/sbin/setup.sh",
+      "teardownCommand": "/usr/local/sbin/teardown.sh",
+      "resizeCommand": "/usr/local/sbin/resize.sh",
+      "snapshotCommand": "/usr/local/sbin/snapshot.sh",
+      "restoreCommand": "/usr/local/sbin/restore.sh"
     }
   helperPod.yaml: |
     apiVersion: v1
@@ -50,7 +50,7 @@ data:
             - name: device-dir
               mountPath: /dev
             - name: lock-dir
-              mountPath: /var/lock
+              mountPath: /run/local-path-csi
       volumes:
         - name: quota-projects
           hostPath:
@@ -65,5 +65,5 @@ data:
             path: /dev
         - name: lock-dir
           hostPath:
-            path: /var/lock
+            path: /run/local-path-csi
             type: DirectoryOrCreate

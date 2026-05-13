@@ -14,7 +14,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -mod=vendor -trimpath -ldflags="-s -w -X main.VERSION=${VERSION}" \
     -o /out/local-path-csi .
 
-FROM gcr.io/distroless/static:nonroot
+# Root-by-default base: the node DaemonSet binds a Unix socket at
+# /var/lib/kubelet/plugins/<driver>/csi.sock (hostPath, root-owned) and
+# CSI NodePublishVolume needs to bind-mount on the host — both require
+# privileges the :nonroot variant can't carry.
+FROM gcr.io/distroless/static
 COPY --from=build /out/local-path-csi /local-path-csi
-USER 65532:65532
 ENTRYPOINT ["/local-path-csi"]

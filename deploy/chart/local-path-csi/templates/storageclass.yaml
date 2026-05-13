@@ -1,0 +1,29 @@
+{{- if .Values.storageClass.create }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name | quote }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
+  {{- if .Values.storageClass.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ .Values.driverName | quote }}
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: {{ .Values.storageClass.allowVolumeExpansion }}
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+parameters:
+  {{- if .Values.storageClass.quotaEnforcement }}
+  quotaEnforcement: {{ .Values.storageClass.quotaEnforcement | quote }}
+  {{- end }}
+  {{- if .Values.storageClass.minSize }}
+  minSize: {{ .Values.storageClass.minSize | quote }}
+  {{- end }}
+  {{- if .Values.storageClass.maxSize }}
+  maxSize: {{ .Values.storageClass.maxSize | quote }}
+  {{- end }}
+  {{- if .Values.storageClass.nodePath }}
+  nodePath: {{ .Values.storageClass.nodePath | quote }}
+  {{- end }}
+{{- end }}

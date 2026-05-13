@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1.7.0
+#
+# Minimal runtime image that consumes a pre-built local-path-csi binary
+# placed in the build context. Used by the e2e workflow to skip the
+# in-Docker Go compile step (faster + survives buildkit slowness).
+#
+# Usage:
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags=-s -w -o /tmp/local-path-csi .
+#   cp /tmp/local-path-csi local-path-csi
+#   docker build -t local-path-csi:e2e -f Dockerfile.runtime.prebuilt .
+# Root-by-default base: the node DaemonSet binds a Unix socket at
+# /var/lib/kubelet/plugins/<driver>/csi.sock (hostPath, root-owned) and
+# CSI NodePublishVolume needs to bind-mount on the host — both require
+# privileges the :nonroot variant can't carry. Controller mode also runs
+# fine as root.
+FROM gcr.io/distroless/static
+COPY local-path-csi /local-path-csi
+ENTRYPOINT ["/local-path-csi"]

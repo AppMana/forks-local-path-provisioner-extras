@@ -1,14 +1,19 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-resources:
-  - rbac.yaml
-  - configmap.yaml
-  - csidriver.yaml
-  - controller.yaml
-  - node.yaml          # Linux node plugin DaemonSet (nodeSelector os=linux)
-  - node-windows.yaml  # Windows node plugin DaemonSet (HostProcess; nodeSelector os=windows)
-  - storageclass.yaml
   # Requires the external-snapshotter CRDs + snapshot-controller installed
-  # cluster-wide (see volumesnapshotclass.yaml). The controller Deployment's
   # csi-snapshotter sidecar also needs them.
-  - volumesnapshotclass.yaml
+resources:
+- rbac.yaml
+- configmap.yaml
+- csidriver.yaml
+- controller.yaml
+- node.yaml
+- node-windows.yaml
+- storageclass.yaml
+images:
+- name: ghcr.io/appmana/local-path-csi
+  newName: local-path-csi
+  newTag: e2e
+- name: ghcr.io/appmana/local-path-helper
+  newName: local-path-helper
+  newTag: e2e

@@ -46,16 +46,27 @@ func TestCapacityReporter_ReportOnce_WritesAnnotation(t *testing.T) {
 	assert.Equal(t, int64(5<<30), free[pathB])
 }
 
-func TestCapacityReporter_MissingPath_ReportsZero(t *testing.T) {
+func TestCapacityReporter_MissingPath_FallsBackToAncestor(t *testing.T) {
+	// Configured nodePath doesn't exist yet (the helper pod creates it on
+	// first provision). The reporter must walk up to the nearest existing
+	// ancestor (here, "/") and report THAT filesystem's free bytes —
+	// otherwise the scheduler filters every node out before the first PVC.
 	kc := fake.NewSimpleClientset(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}})
 	r := NewCapacityReporter(kc, "node-1", []string{"/nonexistent/path/x"}, time.Hour)
+	r.SetStatfs(func(p string) (int64, error) {
+		if p == "/" {
+			return 123456789, nil
+		}
+		return 0, assert.AnError
+	})
 	require.NoError(t, r.reportOnce(context.Background()))
 
 	got, err := kc.CoreV1().Nodes().Get(context.Background(), "node-1", metav1.GetOptions{})
 	require.NoError(t, err)
 	free := FreeBytesByPath(got.Annotations[FreeBytesAnnotationKey])
 	require.NotNil(t, free)
-	assert.Equal(t, int64(0), free["/nonexistent/path/x"])
+	assert.Equal(t, int64(123456789), free["/nonexistent/path/x"],
+		"reporter must walk up to '/' and statfs it when the configured path is absent")
 }
 
 func TestCapacityReporter_StatfsError_ReportsZero(t *testing.T) {

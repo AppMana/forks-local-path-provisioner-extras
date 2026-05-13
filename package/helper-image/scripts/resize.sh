@@ -11,7 +11,7 @@
 #
 # env: VOL_DIR VOL_SIZE_BYTES VOL_QUOTA_TYPE
 set -eu
-. /opt/local-path-provisioner/common.sh
+. /usr/local/sbin/common.sh
 
 # The CSI controller appends "-p <path> -s <size> -m <mode> -a <action>" to
 # every helper-pod command. We act on env vars, but honor "-a check-usage"

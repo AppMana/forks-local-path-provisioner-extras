@@ -9,7 +9,7 @@
 #   btrfs : btrfs subvolume snapshot SRC DST   (read-write clone)
 #   xfs   : cp --reflink=always -aR SRC DST
 set -eu
-. /opt/local-path-provisioner/common.sh
+. /usr/local/sbin/common.sh
 
 [ -n "${SNAP_DIR:-}" ] || die "SNAP_DIR not set"
 [ -n "${VOL_DIR:-}" ]  || die "VOL_DIR not set"

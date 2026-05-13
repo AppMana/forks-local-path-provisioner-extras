@@ -156,7 +156,7 @@ func (p *Provisioner) SnapshotCommand() []string {
 	if p.config != nil && p.config.SnapshotCommand != "" {
 		return []string{p.config.SnapshotCommand}
 	}
-	return []string{"/opt/local-path-provisioner/snapshot.sh"}
+	return []string{"/usr/local/sbin/snapshot.sh"}
 }
 
 // RestoreCommand returns the configured restore command, or the default.
@@ -166,7 +166,7 @@ func (p *Provisioner) RestoreCommand() []string {
 	if p.config != nil && p.config.RestoreCommand != "" {
 		return []string{p.config.RestoreCommand}
 	}
-	return []string{"/opt/local-path-provisioner/restore.sh"}
+	return []string{"/usr/local/sbin/restore.sh"}
 }
 
 // SnapshotTracker exposes the in-memory snapshot index.

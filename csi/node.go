@@ -9,7 +9,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/mount-utils"
+	mountutils "k8s.io/mount-utils"
 )
 
 // NodeServer is the kubelet-side half of the driver. It does not need a kube
@@ -17,22 +17,27 @@ import (
 type NodeServer struct {
 	csi.UnimplementedNodeServer
 
-	nodeID  string
-	mounter mount.Interface
+	nodeID string
+
+	// Mounter override is used by csi-sanity (mount.NewFakeMounter so the
+	// bind-mount specs run without CAP_SYS_ADMIN). In production runs it is
+	// nil and the platform-specific bindMount/unmountQuiet helpers are used
+	// — the Linux path is a direct syscall.Mount(MS_BIND), avoiding the
+	// /bin/mount shell-out that mount-utils does (the distroless runtime
+	// image ships no userspace mount binary).
+	fakeMounter mountutils.Interface
 }
 
 func NewNodeServer(nodeID string) *NodeServer {
-	return &NodeServer{
-		nodeID:  nodeID,
-		mounter: mount.New(""),
-	}
+	return &NodeServer{nodeID: nodeID}
 }
 
-// SetMounter swaps the mount.Interface implementation. Tests use a
-// mount.NewFakeMounter() so bind-mount-flavored sanity specs run without
-// CAP_SYS_ADMIN.
-func (ns *NodeServer) SetMounter(m mount.Interface) {
-	ns.mounter = m
+// SetMounter swaps in a mount.Interface (csi-sanity uses
+// mount.NewFakeMounter() so bind-mount specs don't need CAP_SYS_ADMIN).
+// Production code path uses the platform-specific helpers in
+// mounter_linux.go / mounter_other.go.
+func (ns *NodeServer) SetMounter(m mountutils.Interface) {
+	ns.fakeMounter = m
 }
 
 func (ns *NodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
@@ -94,7 +99,7 @@ func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		return nil, status.Errorf(codes.Internal, "MkdirAll(%s): %v", req.TargetPath, err)
 	}
 
-	notMnt, err := ns.mounter.IsLikelyNotMountPoint(req.TargetPath)
+	notMnt, err := ns.isLikelyNotMountPoint(req.TargetPath)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "IsLikelyNotMountPoint(%s): %v", req.TargetPath, err)
 	}
@@ -103,12 +108,8 @@ func (ns *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishV
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	options := []string{"bind"}
-	if req.Readonly {
-		options = append(options, "ro")
-	}
-	logrus.Infof("NodePublishVolume %s: bind-mount %s -> %s (opts=%v)", req.VolumeId, source, req.TargetPath, options)
-	if err := ns.mounter.Mount(source, req.TargetPath, "", options); err != nil {
+	logrus.Infof("NodePublishVolume %s: bind-mount %s -> %s (readonly=%v)", req.VolumeId, source, req.TargetPath, req.Readonly)
+	if err := ns.bindMount(source, req.TargetPath, req.Readonly); err != nil {
 		_ = os.Remove(req.TargetPath)
 		return nil, status.Errorf(codes.Internal, "bind mount %s -> %s: %v", source, req.TargetPath, err)
 	}
@@ -130,12 +131,12 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 		return &csi.NodeUnpublishVolumeResponse{}, nil
 	}
 
-	notMnt, err := ns.mounter.IsLikelyNotMountPoint(req.TargetPath)
+	notMnt, err := ns.isLikelyNotMountPoint(req.TargetPath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "IsLikelyNotMountPoint(%s): %v", req.TargetPath, err)
 	}
 	if !notMnt {
-		if err := ns.mounter.Unmount(req.TargetPath); err != nil {
+		if err := ns.unmount(req.TargetPath); err != nil {
 			return nil, status.Errorf(codes.Internal, "unmount %s: %v", req.TargetPath, err)
 		}
 	}
@@ -143,6 +144,33 @@ func (ns *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubl
 		logrus.Warnf("NodeUnpublishVolume %s: remove(%s): %v", req.VolumeId, req.TargetPath, err)
 	}
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+// bindMount uses the fake mounter (csi-sanity) when set, otherwise the
+// platform-specific helper (syscall.Mount on Linux, mount-utils elsewhere).
+func (ns *NodeServer) bindMount(src, target string, readOnly bool) error {
+	if ns.fakeMounter != nil {
+		opts := []string{"bind"}
+		if readOnly {
+			opts = append(opts, "ro")
+		}
+		return ns.fakeMounter.Mount(src, target, "", opts)
+	}
+	return bindMount(src, target, readOnly)
+}
+
+func (ns *NodeServer) unmount(target string) error {
+	if ns.fakeMounter != nil {
+		return ns.fakeMounter.Unmount(target)
+	}
+	return unmountQuiet(target)
+}
+
+func (ns *NodeServer) isLikelyNotMountPoint(target string) (bool, error) {
+	if ns.fakeMounter != nil {
+		return ns.fakeMounter.IsLikelyNotMountPoint(target)
+	}
+	return isMountPoint(target)
 }
 
 // NodeGetVolumeStats reports capacity / usage at VolumePath. Used by metrics

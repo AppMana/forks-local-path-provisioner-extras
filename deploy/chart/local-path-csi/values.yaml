@@ -1,0 +1,125 @@
+## Default values for local-path-csi.
+
+# Driver name. Must match CSIDriver.metadata.name. Changing this on an
+# upgrade is NOT supported — existing PVs reference this string and will
+# fail to mount under a new name. Treat as immutable post-install.
+driverName: local-path.appmana.io
+
+# Namespace into which the controller Deployment + node DaemonSet are
+# installed. Helm's release namespace is the default; override only when
+# installing into a cluster-wide pre-existing namespace.
+namespaceOverride: ""
+
+# The driver binary image. Pulled by the controller Deployment and the
+# node DaemonSets.
+image:
+  repository: ghcr.io/appmana/local-path-csi
+  tag: ""              # default: .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# The helper image. Carries the per-FS userspace tools (xfsprogs, quota,
+# e2fsprogs, btrfs-progs on Linux; FSRM on the servercore Windows variant)
+# and the setup/teardown/resize/snapshot/restore scripts. Multi-platform
+# manifest — the kubelet picks the right variant per node OS.
+helperImage:
+  repository: ghcr.io/appmana/local-path-helper
+  tag: ""              # default: .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# CSI sidecar images. Pinned to versions known to work with the driver;
+# override when upgrading a single sidecar in isolation.
+sidecars:
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+    capacityPollInterval: 30s    # how often CSIStorageCapacity is refreshed
+  resizer:
+    image: registry.k8s.io/sig-storage/csi-resizer:v1.13.0
+  snapshotter:
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
+  nodeDriverRegistrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+
+# StorageClass shipped with the chart. Disable if you manage the SC
+# elsewhere (e.g. via flux-managed objects).
+storageClass:
+  create: true
+  name: local-path-csi
+  isDefault: false
+  reclaimPolicy: Delete
+  allowVolumeExpansion: true
+  # quotaEnforcement: auto | xfs | ext4 | btrfs | ntfs | refs | none
+  # auto detects the filesystem at the configured nodePath.
+  quotaEnforcement: auto
+  # Optional bounds per-PVC; empty disables enforcement at the SC layer
+  # (per-path budgets in config.nodePathMap still apply).
+  minSize: ""
+  maxSize: ""
+  # nodePath is the directory on each node where PVs live. Empty means
+  # "any path configured in config.nodePathMap for the selected node".
+  nodePath: ""
+
+# Snapshots require the external-snapshotter CRDs + snapshot-controller
+# installed cluster-wide (see https://github.com/kubernetes-csi/external-snapshotter).
+# Set to false to skip the csi-snapshotter sidecar and the VolumeSnapshotClass.
+snapshots:
+  enabled: true
+  volumeSnapshotClassName: local-path-csi
+  deletionPolicy: Delete
+
+# config.json content. Use the default nodePathMap or override entirely.
+# Per-node entries take precedence over DEFAULT_PATH_FOR_NON_LISTED_NODES.
+# Each path may be a plain string ("/opt/lpp") or an object with a
+# maxCapacity quota: {path: "/opt/lpp", maxCapacity: "100Gi"}.
+config:
+  cmdTimeoutSeconds: 120
+  setupCommand: /usr/local/sbin/setup.sh
+  teardownCommand: /usr/local/sbin/teardown.sh
+  resizeCommand: /usr/local/sbin/resize.sh
+  snapshotCommand: /usr/local/sbin/snapshot.sh
+  restoreCommand: /usr/local/sbin/restore.sh
+  nodePathMap:
+    - node: DEFAULT_PATH_FOR_NON_LISTED_NODES
+      paths:
+        - /opt/local-path-provisioner
+
+# Controller Deployment shape.
+controller:
+  replicas: 1
+  priorityClassName: system-cluster-critical
+  resources:
+    requests: { cpu: 10m,  memory: 64Mi }
+    limits:   { memory: 256Mi }
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+
+# Linux node DaemonSet.
+node:
+  enabled: true
+  priorityClassName: system-node-critical
+  resources:
+    requests: { cpu: 10m,  memory: 32Mi }
+    limits:   { memory: 128Mi }
+  tolerations:
+    - operator: Exists
+
+# Windows node DaemonSet (HostProcess). Set enabled=true once Windows
+# nodes are joined and the CSIDriver supports HostProcess registration
+# in your cluster's kubelet (1.23+). Untoggle to skip the manifest
+# entirely.
+windows:
+  enabled: false
+  priorityClassName: system-node-critical
+  resources:
+    requests: { cpu: 10m,  memory: 64Mi }
+    limits:   { memory: 256Mi }
+  tolerations:
+    - operator: Exists
+
+# Image pull secret names referenced by all three pods. The chart does
+# NOT create them — provision via your own infrastructure or a sealed
+# secret.
+imagePullSecrets: []

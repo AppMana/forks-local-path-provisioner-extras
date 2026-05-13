@@ -1,0 +1,25 @@
+apiVersion: v2
+name: local-path-csi
+description: |
+  CSI driver for local-path storage (appmana/forks-local-path-provisioner-extras).
+  Replaces the pre-CSI rancher/local-path-provisioner. Ships a CSIDriver,
+  controller Deployment with csi-provisioner/csi-resizer/csi-snapshotter
+  sidecars, Linux + (optional) Windows node DaemonSets, RBAC, a default
+  StorageClass and a VolumeSnapshotClass.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - csi
+  - storage
+  - hostpath
+  - local
+  - quota
+  - snapshot
+kubeVersion: ">=1.24.0"
+home: https://github.com/AppMana/forks-local-path-provisioner-extras
+sources:
+  - https://github.com/AppMana/forks-local-path-provisioner-extras
+maintainers:
+  - name: appmana
+    url: https://github.com/AppMana

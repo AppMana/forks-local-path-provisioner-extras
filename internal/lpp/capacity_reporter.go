@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -82,17 +83,32 @@ func (r *CapacityReporter) Run(ctx context.Context) {
 }
 
 // reportOnce statfs's each configured path and patches the Node annotation.
-// Paths that don't exist or that statvfs rejects are reported as 0 free
-// bytes so the controller knows to filter that path out of scheduling.
+// When the configured path does not exist yet, we walk up to the closest
+// existing ancestor and statfs that — the helper pod creates the volume
+// directory inside the configured nodePath on first provision, so the
+// scheduler-relevant free space is whichever filesystem the path will
+// land on. Paths whose entire chain up to "/" is missing (impossible
+// outside tests) and statvfs failures both report 0.
 func (r *CapacityReporter) reportOnce(ctx context.Context) error {
 	free := make(map[string]int64, len(r.paths))
 	for _, p := range r.paths {
-		// Treat absent paths as 0 free bytes — admin will see and fix.
-		if _, err := os.Stat(p); err != nil {
+		target := p
+		for target != "" && target != "/" {
+			if _, err := os.Stat(target); err == nil {
+				break
+			}
+			parent := filepath.Dir(target)
+			if parent == target {
+				target = ""
+				break
+			}
+			target = parent
+		}
+		if target == "" {
 			free[p] = 0
 			continue
 		}
-		bytes, err := r.statfs(p)
+		bytes, err := r.statfs(target)
 		if err != nil {
 			free[p] = 0
 			continue

@@ -59,10 +59,10 @@ FROM scratch AS ci-artifacts
 COPY --from=validate /go/src/github.com/rancher/local-path-provisioner/bin/ /bin/
 COPY --from=validate /validate.done /validate.done
 
-# runtime is the image users actually deploy. Distroless base; the binary
-# selected matches the buildx TARGETARCH.
-FROM gcr.io/distroless/static:nonroot AS runtime
+# runtime is the image users actually deploy. Root distroless because the
+# node DaemonSet binds a hostPath UDS and bind-mounts; the :nonroot variant
+# can't carry those privileges.
+FROM gcr.io/distroless/static AS runtime
 ARG TARGETARCH
 COPY --from=build /go/src/github.com/rancher/local-path-provisioner/bin/local-path-provisioner-${TARGETARCH} /local-path-csi
-USER 65532:65532
 ENTRYPOINT ["/local-path-csi"]

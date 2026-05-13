@@ -1,45 +1,45 @@
 ---
 apiVersion: v1
-kind: Namespace
-metadata:
-  name: local-path-storage
----
-# Controller pod's identity. csi-provisioner / csi-resizer / csi-snapshotter
-# sidecars and our binary all run under this SA.
-apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: local-path-csi-controller
-  namespace: local-path-storage
+  name: {{ include "local-path-csi.controllerName" . }}
+  namespace: {{ include "local-path-csi.namespace" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: local-path-csi-node
-  namespace: local-path-storage
+  name: {{ include "local-path-csi.nodeName" . }}
+  namespace: {{ include "local-path-csi.namespace" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
 ---
-# ServiceAccount used by helper pods spawned by the controller. Distinct from
-# the controller's own SA so we can grant the helper minimal privileges (none
-# beyond what the helper pod's hostPath mounts give).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: local-path-provisioner-service-account
-  namespace: local-path-storage
+  name: {{ include "local-path-csi.helperSAName" . }}
+  namespace: {{ include "local-path-csi.namespace" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: local-path-csi-controller
+  name: {{ include "local-path-csi.controllerName" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
 rules:
-  # Our binary: list PVs (capacity tracker rebuild + DeleteVolume PV lookup),
-  # create/get/delete helper pods, get nodes, get configmaps, get pods/log.
+  # Driver: capacity tracker rebuild + DeleteVolume PV lookup.
   - apiGroups: [""]
     resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch", "patch", "create", "delete"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
@@ -55,33 +55,15 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
-
-  # csi-provisioner --capacity-ownerref-level=2 walks Pod -> ReplicaSet
-  # -> Deployment to anchor CSIStorageCapacity ownership.
-  - apiGroups: ["apps"]
-    resources: ["replicasets", "deployments"]
-    verbs: ["get"]
-
-  # csi-provisioner sidecar
+  # csi-provisioner
   - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses"]
+    resources: ["storageclasses", "csinodes"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["csinodes"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["create", "delete"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["csistoragecapacities"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-
-  # csi-resizer sidecar
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims/status"]
-    verbs: ["patch"]
-
-  # csi-snapshotter sidecar
+  # csi-snapshotter
+  {{- if .Values.snapshots.enabled }}
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotclasses"]
     verbs: ["get", "list", "watch"]
@@ -97,8 +79,8 @@ rules:
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots/status"]
     verbs: ["update", "patch"]
-
-  # Leader election for the sidecars.
+  {{- end }}
+  # Leader election across sidecars.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "watch", "list", "create", "update", "delete", "patch"]
@@ -106,29 +88,31 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: local-path-csi-controller
+  name: {{ include "local-path-csi.controllerName" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: local-path-csi-controller
-    namespace: local-path-storage
+    name: {{ include "local-path-csi.controllerName" . }}
+    namespace: {{ include "local-path-csi.namespace" . }}
 roleRef:
   kind: ClusterRole
-  name: local-path-csi-controller
+  name: {{ include "local-path-csi.controllerName" . }}
   apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: local-path-csi-node
+  name: {{ include "local-path-csi.nodeName" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch", "create", "update", "patch"]
-  # Node-side capacity reporter writes free-bytes-by-path annotations.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "patch"]
-  # Node-side reporter reads the configmap to know which paths to statfs.
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]
@@ -136,12 +120,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: local-path-csi-node
+  name: {{ include "local-path-csi.nodeName" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: local-path-csi-node
-    namespace: local-path-storage
+    name: {{ include "local-path-csi.nodeName" . }}
+    namespace: {{ include "local-path-csi.namespace" . }}
 roleRef:
   kind: ClusterRole
-  name: local-path-csi-node
+  name: {{ include "local-path-csi.nodeName" . }}
   apiGroup: rbac.authorization.k8s.io

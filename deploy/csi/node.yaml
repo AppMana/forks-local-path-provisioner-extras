@@ -60,6 +60,14 @@ spec:
             - name: kubelet-dir
               mountPath: /var/lib/kubelet
               mountPropagation: Bidirectional
+            # NodePublishVolume bind-mounts the volume's source path
+            # (config.json nodePathMap) onto the kubelet target. The source
+            # has to be visible inside the node pod. Mount the configured
+            # data dir as a hostPath with Bidirectional propagation so the
+            # mount appears in both the pod and the host namespaces.
+            - name: data-dir
+              mountPath: /opt/local-path-provisioner
+              mountPropagation: Bidirectional
       volumes:
         - name: plugin-dir
           hostPath:
@@ -77,3 +85,7 @@ spec:
           hostPath:
             path: /var/lib/kubelet
             type: Directory
+        - name: data-dir
+          hostPath:
+            path: /opt/local-path-provisioner
+            type: DirectoryOrCreate

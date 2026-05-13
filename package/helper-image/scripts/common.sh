@@ -7,7 +7,7 @@
 #   VOL_MODE         Filesystem | Block
 #   VOL_QUOTA_TYPE   auto | xfs | ext4 | btrfs | ntfs | refs | none | ""
 #
-# It is sourced (`. /opt/local-path-provisioner/common.sh`) by setup/teardown/resize.
+# It is sourced (`. /usr/local/sbin/common.sh`) by setup/teardown/resize.
 
 set -eu
 
@@ -15,7 +15,10 @@ set -eu
 # helper pod from the host (see the helperPod.yaml in the ConfigMap).
 PROJECTS_FILE=/etc/projects
 PROJID_FILE=/etc/projid
-QUOTA_LOCKFILE=/var/lock/local-path-quota.lock
+# /var/lock is a symlink to /run/lock on Debian/Ubuntu — OCI runtime refuses
+# to mkdir over a symlink ("file exists"). Use /run/local-path-csi which
+# DirectoryOrCreate can safely materialize.
+QUOTA_LOCKFILE=/run/local-path-csi/quota.lock
 
 # log writes a timestamped line to STDERR. It must not go to stdout because
 # several helpers (resolve_quota_type, alloc_project_id, ...) return their

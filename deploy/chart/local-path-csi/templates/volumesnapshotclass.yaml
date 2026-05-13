@@ -1,0 +1,25 @@
+{{- if .Values.snapshots.enabled }}
+{{- /*
+The external-snapshotter CRDs must be installed cluster-wide before this
+manifest applies. We can verify with `lookup` and fail with a useful
+message instead of letting helm crash on an unknown apiVersion.
+*/ -}}
+{{- $crds := (lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "") -}}
+{{- $haveSnapshotCRDs := false -}}
+{{- range $crd := $crds.items -}}
+{{- if eq $crd.metadata.name "volumesnapshotclasses.snapshot.storage.k8s.io" -}}
+{{- $haveSnapshotCRDs = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $haveSnapshotCRDs }}
+{{- fail "snapshots.enabled=true but the external-snapshotter CRDs (volumesnapshotclasses.snapshot.storage.k8s.io) are not installed in the cluster. Install them from https://github.com/kubernetes-csi/external-snapshotter or set snapshots.enabled=false." }}
+{{- end }}
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: {{ .Values.snapshots.volumeSnapshotClassName | quote }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
+driver: {{ .Values.driverName | quote }}
+deletionPolicy: {{ .Values.snapshots.deletionPolicy }}
+{{- end }}

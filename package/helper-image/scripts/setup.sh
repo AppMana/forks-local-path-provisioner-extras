@@ -3,7 +3,7 @@
 #
 # env: VOL_DIR VOL_SIZE_BYTES VOL_MODE VOL_QUOTA_TYPE
 set -eu
-. /opt/local-path-provisioner/common.sh
+. /usr/local/sbin/common.sh
 
 [ -n "${VOL_DIR:-}" ] || die "VOL_DIR not set"
 parent=$(dirname "$VOL_DIR")

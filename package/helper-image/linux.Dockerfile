@@ -21,12 +21,14 @@ RUN apt-get update \
       coreutils \
  && rm -rf /var/lib/apt/lists/*
 
+# Scripts live in /usr/local/sbin, NOT /opt/local-path-provisioner.
+# The helper pod mounts the volume's parent directory at /opt/...
+# via hostPath, which would shadow scripts living under /opt.
 COPY scripts/common.sh scripts/setup.sh scripts/teardown.sh scripts/resize.sh \
      scripts/snapshot.sh scripts/restore.sh \
-     /opt/local-path-provisioner/
-RUN chmod 0755 /opt/local-path-provisioner/*.sh
+     /usr/local/sbin/
+RUN chmod 0755 /usr/local/sbin/setup.sh /usr/local/sbin/teardown.sh \
+                /usr/local/sbin/resize.sh /usr/local/sbin/snapshot.sh \
+                /usr/local/sbin/restore.sh /usr/local/sbin/common.sh
 
-# The helper pod's command is set by the CSI controller (config.json
-# setupCommand/teardownCommand/resizeCommand point at these scripts). No
-# ENTRYPOINT — the pod template supplies one.
-WORKDIR /opt/local-path-provisioner
+WORKDIR /

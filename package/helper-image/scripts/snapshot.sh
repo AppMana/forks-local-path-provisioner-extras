@@ -14,7 +14,7 @@
 #           across in-flight writes — quiesce the workload first)
 #   ext4 / other : unsupported — snapshots require reflink or subvolumes
 set -eu
-. /opt/local-path-provisioner/common.sh
+. /usr/local/sbin/common.sh
 
 # Parse "-a <action>" (default: snapshot).
 action=snapshot

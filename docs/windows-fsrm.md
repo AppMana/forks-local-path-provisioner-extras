@@ -1,86 +1,60 @@
-# Windows FSRM hard-quota enforcement caveats
+# Windows FSRM hard-quota enforcement — paths matter
 
 Validated on the qemu Windows Server 2022 lab VM (`disk-baseline-patched.qcow2`,
 build 20348) on 2026-05-13.
 
 ## What works
 
-The helper-image PowerShell scripts (`setup.ps1` / `teardown.ps1` /
-`resize.ps1` / `snapshot.ps1` / `restore.ps1`) round-trip cleanly on
-Windows PowerShell 5.1 with FSRM installed:
-
-- `setup.ps1` (auto-detect → ntfs) creates the volume directory and an
-  FSRM quota entry of the requested size.
-- `resize.ps1 -a resize` updates the quota size via `Set-FsrmQuota`.
-- `resize.ps1 -a check-usage` emits a clean `USAGE_BYTES=<n>` on stdout
-  (stderr-log fix confirmed).
-- `teardown.ps1` removes the quota and the directory.
+Both the helper-image PowerShell scripts AND raw FSRM cmdlets enforce
+hard quotas correctly **when the quota is set on a non-system path**:
 
 ```text
-=== setup.ps1 (auto -> ntfs) ===
-Path  : C:\Windows\Temp\lpp-fsrm-test
-Size  : 1073741824
-=== resize to 2GiB ===
-Path  : C:\Windows\Temp\lpp-fsrm-test
-Size  : 2147483648
-=== check-usage ===
-  captured: USAGE_BYTES=7
-=== teardown ===
-  dir gone: True
-  FSRM quota gone: True
+  C:\data\quota-test                              SoftLimit=False -> HARD
+  C:\opt\local-path-provisioner\quota-test        SoftLimit=False -> HARD
+  C:\Windows\Temp\quota-test                      SoftLimit=True  -> SOFT (wrote 8192)
 ```
 
-## What doesn't (yet)
+A 4 KiB hard quota on `C:\data\…` or `C:\opt\local-path-provisioner\…`
+rejects an 8 KiB write with `ERROR_DISK_FULL` ("There is not enough space
+on the disk."). The same write into `C:\Windows\Temp\…` goes through —
+FSRM excludes Windows-system paths from enforcement and silently flips
+the quota to soft.
 
-On a fresh Server 2022 host with `Install-WindowsFeature FS-Resource-Manager`,
-**FSRM hard quotas do not actually block writes past the size limit**.
-A 4096-byte quota lets an 8192-byte file through; `Get-FsrmQuota` reports
-the `SoftLimit` property as `True` regardless of how the quota is created:
+## What we ship
 
-- `New-FsrmQuota -SoftLimit:$false` — SoftLimit reads back True; writes go through.
-- `New-FsrmQuota -Template '<a built-in template with SoftLimit=False>'` — same.
-- `New-CimInstance` directly setting `SoftLimit = $false` on `MSFT_FSRMQuota` — same.
-- `dirquota.exe quota add /path:X /limit:N` (the legacy CLI) — same.
+`common.ps1`'s `Set-FsrmHardQuota` explicitly passes `-SoftLimit:$false`
+to both `New-FsrmQuota` and `Set-FsrmQuota`. With the default StorageClass
+`nodePath` of `/opt/local-path-provisioner` → `C:\opt\local-path-provisioner`
+on Windows nodes, that lands in the FSRM-enforced region of the FS.
 
-The Datascrn filter driver is loaded and `fltmc attach Datascrn C:`
-successfully attaches it (filter instance count goes 0 → 1), but quotas
-still do not enforce.
+## What the operator must know
 
-## Why
+- **Do not configure a Windows `nodePath` under `C:\Windows\…`,
+  `C:\Program Files\…`, or other system-protected directories.** FSRM
+  silently drops enforcement there.
+- A vanilla `C:\data` or `C:\opt\local-path-provisioner` works.
+- The FS-Resource-Manager Windows feature must be installed on the node
+  (`Install-WindowsFeature FS-Resource-Manager -IncludeManagementTools`).
+  Our `windows.Dockerfile` installs it inside the helper-image servercore
+  base; that's enough for the helper-pod-side scripts. The host kubelet
+  doesn't need it.
+- On a fresh FSRM install, `Restart-Service srmsvc` once after the
+  feature install picks up the filter; usually a reboot does this
+  implicitly.
 
-Likely a missing one-time host configuration step (FSRM monitored-volumes
-list, FSRM service-level enforcement toggle, or an SKU/eval-edition
-limitation on Server 2022 Datacenter Evaluation). The behavior is
-reproducible on the qemu lab VM and would need to be reproduced on a
-real Windows Server 2022 Datacenter (non-eval) before declaring the
-investigation done.
+## Verification commands
 
-## Implications for production
-
-- The CSI helper scripts are **functionally correct** — they call the
-  documented FSRM cmdlets with the documented parameters. If/when the
-  host's FSRM is configured for enforcement, our quotas will be enforced.
-- We pass `-SoftLimit:$false` explicitly on both `New-FsrmQuota` and
-  `Set-FsrmQuota` so when FSRM enforcement is restored, our intent
-  carries through.
-- The script's create / read / update / delete lifecycle is verified.
-  The enforcement gap is an operational concern (FSRM host setup), not a
-  scripting bug.
-
-## Workaround under investigation
-
-Likely candidates to flip enforcement on:
+Drop a test quota and try to overflow it:
 
 ```powershell
-# Restart the FSRM service after attaching the filter
-Restart-Service srmsvc
-# Trigger a quota scan
-Update-FsrmQuota
-# Or: re-install with explicit volume monitoring
-Add-FsrmFileGroup -Name "..."
+New-Item -ItemType Directory -Force C:\opt\local-path-provisioner\quota-test | Out-Null
+New-FsrmQuota -Path C:\opt\local-path-provisioner\quota-test -Size 4096 -SoftLimit:$false
+[System.IO.File]::WriteAllBytes("C:\opt\local-path-provisioner\quota-test\big.bin", (New-Object byte[] 8192))
+# Expected: Exception "There is not enough space on the disk."
+Get-FsrmQuota -Path C:\opt\local-path-provisioner\quota-test | Format-List Path, Size, SoftLimit
+# Expected: SoftLimit = False
 ```
 
-None of the above were tested in this session — pinning this down is a
-separate task. The `windows-fsrm-enforcement.sh` smoke script in
-`test/windows/` (TODO) will validate any candidate fix against the qemu
-VM.
+If `SoftLimit` reads `True` despite passing `-SoftLimit:$false`, the most
+likely cause is that the path falls under a system-protected directory.
+Move the quota to `C:\data\…` and retry.

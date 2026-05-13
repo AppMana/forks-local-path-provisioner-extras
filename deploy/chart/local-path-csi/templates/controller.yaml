@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "local-path-csi.controllerName" . }}
+  namespace: {{ include "local-path-csi.namespace" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
+    app: {{ include "local-path-csi.controllerName" . }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "local-path-csi.controllerName" . }}
+  # Recreate strategy: only one provisioner / resizer / snapshotter can hold
+  # the leader-election lease at a time, and the new pod can't start until the
+  # old one's socket is gone. Rolling-update produces a few seconds of
+  # double-leader contention which is harmless but noisy.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "local-path-csi.labels" . | nindent 8 }}
+        app: {{ include "local-path-csi.controllerName" . }}
+    spec:
+      serviceAccountName: {{ include "local-path-csi.controllerName" . }}
+      priorityClassName: {{ .Values.controller.priorityClassName }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: csi-provisioner
+          image: {{ .Values.sidecars.provisioner.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=true
+            - --extra-create-metadata=true
+            - --feature-gates=Topology=true
+            - --enable-capacity=true
+            - --capacity-ownerref-level=2
+            - --capacity-poll-interval={{ .Values.sidecars.provisioner.capacityPollInterval }}
+            - --strict-topology=true
+            - --immediate-topology=false
+            - --v=2
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+        - name: csi-resizer
+          image: {{ .Values.sidecars.resizer.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=true
+            - --v=2
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+        {{- if .Values.snapshots.enabled }}
+        - name: csi-snapshotter
+          image: {{ .Values.sidecars.snapshotter.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=true
+            - --v=2
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+        {{- end }}
+        - name: local-path-csi
+          image: {{ include "local-path-csi.driverImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --mode=controller
+            - --csi-endpoint=unix:///csi/csi.sock
+            - --namespace=$(POD_NAMESPACE)
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            - name: HELPER_IMAGE
+              value: {{ include "local-path-csi.helperImage" . }}
+            - name: SERVICE_ACCOUNT_NAME
+              value: {{ include "local-path-csi.helperSAName" . }}
+          {{- with .Values.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: socket-dir, mountPath: /csi }
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

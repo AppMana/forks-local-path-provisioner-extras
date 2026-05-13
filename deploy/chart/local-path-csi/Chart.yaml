@@ -7,7 +7,7 @@ description: |
   sidecars, Linux + (optional) Windows node DaemonSets, RBAC, a default
   StorageClass and a VolumeSnapshotClass.
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.1.0"
 keywords:
   - csi

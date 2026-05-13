@@ -1,0 +1,84 @@
+{{- if .Values.windows.enabled }}
+# Windows CSI node plugin DaemonSet.
+#
+# Runs as a HostProcess container (Kubernetes >= 1.23 GA): the driver and the
+# node-driver-registrar execute as host processes with direct access to the
+# node filesystem, so csi-proxy is NOT required. The host's kubelet must have
+# the HostProcess feature enabled (default on supported versions).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "local-path-csi.nodeWindowsName" . }}
+  namespace: {{ include "local-path-csi.namespace" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
+    app: {{ include "local-path-csi.nodeWindowsName" . }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "local-path-csi.nodeWindowsName" . }}
+  template:
+    metadata:
+      labels:
+        {{- include "local-path-csi.labels" . | nindent 8 }}
+        app: {{ include "local-path-csi.nodeWindowsName" . }}
+    spec:
+      serviceAccountName: {{ include "local-path-csi.nodeName" . }}
+      priorityClassName: {{ .Values.windows.priorityClassName }}
+      nodeSelector:
+        kubernetes.io/os: windows
+        {{- with .Values.windows.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.windows.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.windows.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        windowsOptions:
+          hostProcess: true
+          runAsUserName: "NT AUTHORITY\\SYSTEM"
+      hostNetwork: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.sidecars.nodeDriverRegistrar.image }}
+          command:
+            - "$env:CONTAINER_SANDBOX_MOUNT_POINT/csi-node-driver-registrar.exe"
+          args:
+            - --csi-address=unix://C:\\var\\lib\\kubelet\\plugins\\{{ .Values.driverName }}\\csi.sock
+            - --kubelet-registration-path=C:\\var\\lib\\kubelet\\plugins\\{{ .Values.driverName }}\\csi.sock
+            - --plugin-registration-path=C:\\var\\lib\\kubelet\\plugins_registry
+            - --v=2
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+        - name: local-path-csi
+          image: {{ include "local-path-csi.driverImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "$env:CONTAINER_SANDBOX_MOUNT_POINT/local-path-csi.exe"
+          args:
+            - --mode=node
+            - --csi-endpoint=unix://C:\\var\\lib\\kubelet\\plugins\\{{ .Values.driverName }}\\csi.sock
+            - --namespace=$(POD_NAMESPACE)
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+          {{- with .Values.windows.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

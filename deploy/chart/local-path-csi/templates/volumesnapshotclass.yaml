@@ -1,19 +1,23 @@
 {{- if .Values.snapshots.enabled }}
 {{- /*
 The external-snapshotter CRDs must be installed cluster-wide before this
-manifest applies. We can verify with `lookup` and fail with a useful
-message instead of letting helm crash on an unknown apiVersion.
+manifest applies. When the chart is rendered against a live cluster
+(helm install / upgrade), use `lookup` to confirm. During plain
+`helm template` (lookup returns empty), skip the check so CI/dry-run
+flows still produce parseable YAML.
 */ -}}
 {{- $crds := (lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "") -}}
-{{- $haveSnapshotCRDs := false -}}
-{{- range $crd := $crds.items -}}
-{{- if eq $crd.metadata.name "volumesnapshotclasses.snapshot.storage.k8s.io" -}}
-{{- $haveSnapshotCRDs = true -}}
+{{- if and $crds $crds.items -}}
+{{-   $haveSnapshotCRDs := false -}}
+{{-   range $crd := $crds.items -}}
+{{-     if eq $crd.metadata.name "volumesnapshotclasses.snapshot.storage.k8s.io" -}}
+{{-       $haveSnapshotCRDs = true -}}
+{{-     end -}}
+{{-   end -}}
+{{-   if not $haveSnapshotCRDs -}}
+{{-     fail "snapshots.enabled=true but the external-snapshotter CRDs (volumesnapshotclasses.snapshot.storage.k8s.io) are not installed in the cluster. Install them from https://github.com/kubernetes-csi/external-snapshotter or set snapshots.enabled=false." -}}
+{{-   end -}}
 {{- end -}}
-{{- end -}}
-{{- if not $haveSnapshotCRDs }}
-{{- fail "snapshots.enabled=true but the external-snapshotter CRDs (volumesnapshotclasses.snapshot.storage.k8s.io) are not installed in the cluster. Install them from https://github.com/kubernetes-csi/external-snapshotter or set snapshots.enabled=false." }}
-{{- end }}
 apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:

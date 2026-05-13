@@ -1,0 +1,105 @@
+{{- if .Values.node.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "local-path-csi.nodeName" . }}
+  namespace: {{ include "local-path-csi.namespace" . }}
+  labels:
+    {{- include "local-path-csi.labels" . | nindent 4 }}
+    app: {{ include "local-path-csi.nodeName" . }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "local-path-csi.nodeName" . }}
+  template:
+    metadata:
+      labels:
+        {{- include "local-path-csi.labels" . | nindent 8 }}
+        app: {{ include "local-path-csi.nodeName" . }}
+    spec:
+      serviceAccountName: {{ include "local-path-csi.nodeName" . }}
+      priorityClassName: {{ .Values.node.priorityClassName }}
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- with .Values.node.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.sidecars.nodeDriverRegistrar.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/{{ .Values.driverName }}/csi.sock
+            - --v=2
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            - { name: registration-dir, mountPath: /registration }
+        - name: local-path-csi
+          image: {{ include "local-path-csi.driverImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Privileged so syscall.Mount(MS_BIND) inside NodePublishVolume can
+          # bind-mount the source path onto the kubelet target. The distroless
+          # base means there is no /bin/mount to fall back to.
+          securityContext:
+            privileged: true
+          args:
+            - --mode=node
+            - --csi-endpoint=unix:///csi/csi.sock
+            - --namespace=$(POD_NAMESPACE)
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: plugin-dir, mountPath: /csi }
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            {{- range $i, $path := .Values.node.dataPaths }}
+            - name: data-dir-{{ $i }}
+              mountPath: {{ $path }}
+              mountPropagation: Bidirectional
+            {{- end }}
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/{{ .Values.driverName }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: pods-mount-dir
+          hostPath: { path: /var/lib/kubelet/pods, type: Directory }
+        - name: kubelet-dir
+          hostPath: { path: /var/lib/kubelet, type: Directory }
+        {{- range $i, $path := .Values.node.dataPaths }}
+        - name: data-dir-{{ $i }}
+          hostPath:
+            path: {{ $path }}
+            type: DirectoryOrCreate
+        {{- end }}
+{{- end }}

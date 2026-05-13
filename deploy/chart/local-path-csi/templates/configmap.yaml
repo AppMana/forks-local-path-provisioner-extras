@@ -43,3 +43,28 @@ data:
           hostPath: { path: /dev }
         - name: lock-dir
           hostPath: { path: /run/local-path-csi, type: DirectoryOrCreate }
+  {{- if .Values.windows.enabled }}
+  # Windows helper-pod template. HostProcess (kubelet >= 1.23), runs as
+  # NT AUTHORITY\SYSTEM. The helper image must include the FS-Resource-Manager
+  # Windows feature (servercore base, not nanoserver) — see windows.Dockerfile.
+  helperPod-windows.yaml: |
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: helper-pod
+    spec:
+      priorityClassName: system-node-critical
+      securityContext:
+        windowsOptions:
+          hostProcess: true
+          runAsUserName: "NT AUTHORITY\\SYSTEM"
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: windows
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: helper-pod
+          image: {{ include "local-path-csi.helperImage" . }}
+          imagePullPolicy: {{ .Values.helperImage.pullPolicy }}
+  {{- end }}

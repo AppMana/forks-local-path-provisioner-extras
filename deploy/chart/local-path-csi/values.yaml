@@ -33,7 +33,9 @@ sidecars:
     image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
     capacityPollInterval: 30s    # how often CSIStorageCapacity is refreshed
   resizer:
-    image: registry.k8s.io/sig-storage/csi-resizer:v1.13.0
+    # NOTE: csi-resizer's release tags sort lexicographically — v1.13.0 was
+    # NEVER published. Stay on >= v1.14.0.
+    image: registry.k8s.io/sig-storage/csi-resizer:v1.14.0
   snapshotter:
     image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
   nodeDriverRegistrar:
@@ -105,6 +107,13 @@ node:
     limits:   { memory: 128Mi }
   tolerations:
     - operator: Exists
+  # Host paths that the node plugin will bind-mount into pod targets. Must
+  # be a superset of every path referenced in config.nodePathMap (and any
+  # per-StorageClass nodePathMap). Each is mounted Bidirectional so the
+  # NodePublishVolume bind shows up in both the pod and the host mount
+  # namespace. Keep this short — every entry is a hostPath grant.
+  dataPaths:
+    - /opt/local-path-provisioner
 
 # Windows node DaemonSet (HostProcess). Set enabled=true once Windows
 # nodes are joined and the CSIDriver supports HostProcess registration

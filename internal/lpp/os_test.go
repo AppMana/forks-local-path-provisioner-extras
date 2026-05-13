@@ -59,15 +59,15 @@ func TestResolveTargetOS(t *testing.T) {
 
 func TestCommandFor_LinuxDefaults(t *testing.T) {
 	p := newTestProvisioner(t, `{"nodePathMap":[{"node":"n","paths":["/a"]}]}`)
-	assert.Equal(t, []string{"/usr/local/sbin/setup.sh"}, p.commandFor(ActionTypeCreate, OSLinux))
-	assert.Equal(t, []string{"/usr/local/sbin/teardown.sh"}, p.commandFor(ActionTypeDelete, OSLinux))
-	assert.Equal(t, []string{"/usr/local/sbin/snapshot.sh"}, p.commandFor(ActionTypeSnapshot, OSLinux))
-	assert.Equal(t, []string{"/usr/local/sbin/snapshot.sh"}, p.commandFor(ActionTypeDeleteSnapshot, OSLinux))
+	assert.Equal(t, []string{"/usr/local/sbin/setup.sh"}, p.commandFor(ActionTypeCreate, OSLinux, nil))
+	assert.Equal(t, []string{"/usr/local/sbin/teardown.sh"}, p.commandFor(ActionTypeDelete, OSLinux, nil))
+	assert.Equal(t, []string{"/usr/local/sbin/snapshot.sh"}, p.commandFor(ActionTypeSnapshot, OSLinux, nil))
+	assert.Equal(t, []string{"/usr/local/sbin/snapshot.sh"}, p.commandFor(ActionTypeDeleteSnapshot, OSLinux, nil))
 }
 
 func TestCommandFor_WindowsDefaults(t *testing.T) {
 	p := newTestProvisioner(t, `{"nodePathMap":[{"node":"n","paths":["/a"]}]}`)
-	got := p.commandFor(ActionTypeCreate, OSWindows)
+	got := p.commandFor(ActionTypeCreate, OSWindows, nil)
 	assert.Equal(t, []string{"powershell", "-NoProfile", "-File", `C:\opt\local-path-csi-scripts\setup.ps1`}, got)
 }
 
@@ -77,7 +77,7 @@ func TestCommandFor_WindowsOverride_String(t *testing.T) {
       "windows":{"setupCommand":"powershell -File X:\\custom.ps1"}
     }`
 	p := newTestProvisioner(t, cfg)
-	got := p.commandFor(ActionTypeCreate, OSWindows)
+	got := p.commandFor(ActionTypeCreate, OSWindows, nil)
 	assert.Equal(t, []string{"powershell", "-File", `X:\custom.ps1`}, got)
 }
 
@@ -87,8 +87,68 @@ func TestCommandFor_WindowsOverride_Array(t *testing.T) {
       "windows":{"snapshotCommand":["pwsh","-File","C:\\Program Files\\snap.ps1"]}
     }`
 	p := newTestProvisioner(t, cfg)
-	got := p.commandFor(ActionTypeSnapshot, OSWindows)
+	got := p.commandFor(ActionTypeSnapshot, OSWindows, nil)
 	assert.Equal(t, []string{"pwsh", "-File", `C:\Program Files\snap.ps1`}, got)
+}
+
+// Per-StorageClass overrides take precedence over the global / per-OS
+// overrides on the top-level config. Linux path.
+func TestCommandFor_StorageClassOverride_Linux(t *testing.T) {
+	cfg := `{
+      "storageClassConfigs": {
+        "fast": {
+          "nodePathMap": [{"node":"n","paths":["/fast"]}],
+          "setupCommand": "/opt/fast-setup.sh",
+          "snapshotCommand": "/opt/fast-snapshot.sh"
+        },
+        "slow": {
+          "nodePathMap": [{"node":"n","paths":["/slow"]}]
+        }
+      },
+      "setupCommand": "/opt/global-setup.sh"
+    }`
+	p := newTestProvisioner(t, cfg)
+	fast := p.config.StorageClassConfigs["fast"]
+	slow := p.config.StorageClassConfigs["slow"]
+
+	// fast: setup + snapshot are per-SC. teardown falls through to global default.
+	assert.Equal(t, []string{"/opt/fast-setup.sh"}, p.commandFor(ActionTypeCreate, OSLinux, &fast))
+	assert.Equal(t, []string{"/opt/fast-snapshot.sh"}, p.commandFor(ActionTypeSnapshot, OSLinux, &fast))
+	assert.Equal(t, []string{"/usr/local/sbin/teardown.sh"}, p.commandFor(ActionTypeDelete, OSLinux, &fast))
+
+	// slow has no per-SC commands: setup falls back to the global override, the rest to per-OS defaults.
+	assert.Equal(t, []string{"/opt/global-setup.sh"}, p.commandFor(ActionTypeCreate, OSLinux, &slow))
+	assert.Equal(t, []string{"/usr/local/sbin/snapshot.sh"}, p.commandFor(ActionTypeSnapshot, OSLinux, &slow))
+}
+
+// Per-StorageClass override applies on Windows too, including the
+// string-or-array shape on the Windows sub-block.
+func TestCommandFor_StorageClassOverride_Windows(t *testing.T) {
+	cfg := `{
+      "storageClassConfigs": {
+        "winfast": {
+          "nodePathMap": [{"node":"n","paths":["/fast"]}],
+          "windows": {
+            "setupCommand": ["pwsh","-File","C:\\opt\\fast.ps1"],
+            "snapshotCommand": "powershell -File C:\\opt\\snap.ps1"
+          }
+        }
+      }
+    }`
+	p := newTestProvisioner(t, cfg)
+	winfast := p.config.StorageClassConfigs["winfast"]
+
+	assert.Equal(t,
+		[]string{"pwsh", "-File", `C:\opt\fast.ps1`},
+		p.commandFor(ActionTypeCreate, OSWindows, &winfast))
+	assert.Equal(t,
+		[]string{"powershell", "-File", `C:\opt\snap.ps1`},
+		p.commandFor(ActionTypeSnapshot, OSWindows, &winfast))
+
+	// teardown not overridden: falls back to the per-OS default.
+	assert.Equal(t,
+		[]string{"powershell", "-NoProfile", "-File", `C:\opt\local-path-csi-scripts\teardown.ps1`},
+		p.commandFor(ActionTypeDelete, OSWindows, &winfast))
 }
 
 func TestSetWindowsHelperPodTemplate(t *testing.T) {

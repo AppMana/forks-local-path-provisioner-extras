@@ -74,9 +74,34 @@ func CanonicalizeConfig(data *ConfigData) (*Config, error) {
 	return cfg, nil
 }
 
+// splitCmdString tokenizes a command line on whitespace. Empty input returns
+// nil so callers can distinguish "not set" from "set to []".
+func splitCmdString(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	return strings.Fields(s)
+}
+
 func canonicalizeStorageClassConfig(data *StorageClassConfigData) (cfg *StorageClassConfig, err error) {
 	defer func() { err = errors.Wrapf(err, "StorageClass config canonicalization failed") }()
 	cfg = &StorageClassConfig{SharedFileSystemPath: data.SharedFileSystemPath}
+
+	cfg.SetupCommand = splitCmdString(data.SetupCommand)
+	cfg.TeardownCommand = splitCmdString(data.TeardownCommand)
+	cfg.ResizeCommand = splitCmdString(data.ResizeCommand)
+	cfg.SnapshotCommand = splitCmdString(data.SnapshotCommand)
+	cfg.RestoreCommand = splitCmdString(data.RestoreCommand)
+	if data.Windows != nil {
+		cfg.Windows = &WindowsConfig{
+			SetupCommand:    data.Windows.SetupCommand,
+			TeardownCommand: data.Windows.TeardownCommand,
+			ResizeCommand:   data.Windows.ResizeCommand,
+			SnapshotCommand: data.Windows.SnapshotCommand,
+			RestoreCommand:  data.Windows.RestoreCommand,
+		}
+	}
 
 	if data.MinSize != "" {
 		q, err := resource.ParseQuantity(data.MinSize)

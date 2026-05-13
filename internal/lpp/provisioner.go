@@ -176,34 +176,83 @@ var (
 	}
 )
 
-// commandFor returns the command to invoke for (action, osType). Config
-// overrides take precedence; missing values fall back to per-OS defaults.
-// The caller holds no locks — this method takes configMutex internally.
-func (p *Provisioner) commandFor(action ActionType, osType string) []string {
+// scActionCmd returns the per-OS command override on a StorageClassConfig for
+// a given action, or nil if no override is set. Used as the first step in
+// commandFor's precedence chain.
+func scActionCmd(sc *StorageClassConfig, action ActionType, osType string) []string {
+	if sc == nil {
+		return nil
+	}
+	if osType == OSWindows {
+		if sc.Windows == nil {
+			return nil
+		}
+		switch action {
+		case ActionTypeCreate:
+			return sc.Windows.SetupCommand
+		case ActionTypeDelete:
+			return sc.Windows.TeardownCommand
+		case ActionTypeResize:
+			return sc.Windows.ResizeCommand
+		case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
+			return sc.Windows.SnapshotCommand
+		case ActionTypeRestore:
+			return sc.Windows.RestoreCommand
+		}
+		return nil
+	}
+	switch action {
+	case ActionTypeCreate:
+		return sc.SetupCommand
+	case ActionTypeDelete:
+		return sc.TeardownCommand
+	case ActionTypeResize:
+		return sc.ResizeCommand
+	case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
+		return sc.SnapshotCommand
+	case ActionTypeRestore:
+		return sc.RestoreCommand
+	}
+	return nil
+}
+
+// commandFor returns the command to invoke for (action, osType, sc). The
+// precedence chain is:
+//   1. per-StorageClass override (sc.<cmd> / sc.Windows.<cmd>)
+//   2. per-OS override on the global config (config.Windows.<cmd>)
+//   3. global override (config.<cmd>)
+//   4. built-in default for the resolved OS
+//
+// sc may be nil; that just skips step 1. The caller holds no locks — this
+// method takes configMutex internally.
+func (p *Provisioner) commandFor(action ActionType, osType string, sc *StorageClassConfig) []string {
 	p.configMutex.RLock()
 	defer p.configMutex.RUnlock()
+	if cmd := scActionCmd(sc, action, osType); len(cmd) > 0 {
+		return append([]string(nil), cmd...)
+	}
 	if osType == OSWindows {
 		if p.config != nil && p.config.Windows != nil {
 			switch action {
 			case ActionTypeCreate:
 				if len(p.config.Windows.SetupCommand) > 0 {
-					return p.config.Windows.SetupCommand
+					return append([]string(nil), p.config.Windows.SetupCommand...)
 				}
 			case ActionTypeDelete:
 				if len(p.config.Windows.TeardownCommand) > 0 {
-					return p.config.Windows.TeardownCommand
+					return append([]string(nil), p.config.Windows.TeardownCommand...)
 				}
 			case ActionTypeResize:
 				if len(p.config.Windows.ResizeCommand) > 0 {
-					return p.config.Windows.ResizeCommand
+					return append([]string(nil), p.config.Windows.ResizeCommand...)
 				}
 			case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
 				if len(p.config.Windows.SnapshotCommand) > 0 {
-					return p.config.Windows.SnapshotCommand
+					return append([]string(nil), p.config.Windows.SnapshotCommand...)
 				}
 			case ActionTypeRestore:
 				if len(p.config.Windows.RestoreCommand) > 0 {
-					return p.config.Windows.RestoreCommand
+					return append([]string(nil), p.config.Windows.RestoreCommand...)
 				}
 			}
 		}
@@ -238,12 +287,24 @@ func (p *Provisioner) commandFor(action ActionType, osType string) []string {
 
 // SetupCommand / TeardownCommand / ResizeCommand / SnapshotCommand /
 // RestoreCommand are kept as shims for tests and external callers that
-// don't yet pass an osType. They return the Linux command.
-func (p *Provisioner) SetupCommand() []string    { return p.commandFor(ActionTypeCreate, OSLinux) }
-func (p *Provisioner) TeardownCommand() []string { return p.commandFor(ActionTypeDelete, OSLinux) }
-func (p *Provisioner) ResizeCommand() []string   { return p.commandFor(ActionTypeResize, OSLinux) }
-func (p *Provisioner) SnapshotCommand() []string { return p.commandFor(ActionTypeSnapshot, OSLinux) }
-func (p *Provisioner) RestoreCommand() []string  { return p.commandFor(ActionTypeRestore, OSLinux) }
+// don't yet pass an osType or a StorageClass selector. They return the
+// Linux global / default command — i.e. what runs on a Linux node with
+// no per-SC override.
+func (p *Provisioner) SetupCommand() []string {
+	return p.commandFor(ActionTypeCreate, OSLinux, nil)
+}
+func (p *Provisioner) TeardownCommand() []string {
+	return p.commandFor(ActionTypeDelete, OSLinux, nil)
+}
+func (p *Provisioner) ResizeCommand() []string {
+	return p.commandFor(ActionTypeResize, OSLinux, nil)
+}
+func (p *Provisioner) SnapshotCommand() []string {
+	return p.commandFor(ActionTypeSnapshot, OSLinux, nil)
+}
+func (p *Provisioner) RestoreCommand() []string {
+	return p.commandFor(ActionTypeRestore, OSLinux, nil)
+}
 
 // SnapshotTracker exposes the in-memory snapshot index.
 func (p *Provisioner) SnapshotTracker() *SnapshotTracker { return p.snapshotTracker }
@@ -554,7 +615,7 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 
 	cmd := a.Cmd
 	if len(cmd) == 0 {
-		cmd = p.commandFor(a.Type, osType)
+		cmd = p.commandFor(a.Type, osType, a.Config)
 	}
 	helperPod.Name = helperPod.Name + "-" + string(a.Type) + "-" + o.Name
 	if len(helperPod.Name) > HelperPodNameMaxLength {

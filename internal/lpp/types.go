@@ -77,6 +77,18 @@ type StorageClassConfigData struct {
 	SharedFileSystemPath string             `json:"sharedFileSystemPath,omitempty"`
 	MinSize              string             `json:"minSize,omitempty"`
 	MaxSize              string             `json:"maxSize,omitempty"`
+
+	// Per-StorageClass command overrides. When set, take precedence over the
+	// top-level commands in ConfigData. Empty fields fall through to the
+	// global overrides and then to the per-OS defaults baked into the
+	// controller. The Windows sub-block has the same precedence semantics
+	// per action.
+	SetupCommand    string             `json:"setupCommand,omitempty"`
+	TeardownCommand string             `json:"teardownCommand,omitempty"`
+	ResizeCommand   string             `json:"resizeCommand,omitempty"`
+	SnapshotCommand string             `json:"snapshotCommand,omitempty"`
+	RestoreCommand  string             `json:"restoreCommand,omitempty"`
+	Windows         *WindowsConfigData `json:"windows,omitempty"`
 }
 
 type ConfigData struct {
@@ -146,6 +158,15 @@ type StorageClassConfig struct {
 	SharedFileSystemPath string
 	MinSize              *resource.Quantity
 	MaxSize              *resource.Quantity
+
+	// Per-StorageClass command overrides (canonical form). Empty slices mean
+	// "fall through to the global overrides and then to per-OS defaults".
+	SetupCommand    []string
+	TeardownCommand []string
+	ResizeCommand   []string
+	SnapshotCommand []string
+	RestoreCommand  []string
+	Windows         *WindowsConfig
 }
 
 type Config struct {

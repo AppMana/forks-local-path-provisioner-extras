@@ -71,14 +71,17 @@ only parse `-a` when they need to distinguish actions.
 
 ## Override matrix
 
-The controller resolves the command for `(action, OS)` in this order, picking
-the first non-empty match:
+The controller resolves the command for `(action, OS, StorageClass)` in this
+order, picking the first non-empty match:
 
-1. Per-StorageClass override (planned; see `StorageClassConfigs.<name>.<cmd>` —
-   currently only the global override is wired)
-2. Per-OS override for the action — `windows.snapshotCommand`, etc.
-3. Global override for the action — `snapshotCommand`, etc.
+1. Per-StorageClass override for the resolved OS — `storageClassConfigs.<name>.windows.<cmd>` (Windows) or `storageClassConfigs.<name>.<cmd>` (Linux)
+2. Per-OS override on the global config — `windows.<cmd>`
+3. Global override on the global config — `<cmd>`
 4. Built-in default for the action and the resolved OS
+
+The StorageClass is selected per PVC via the `storageClassConfig` parameter
+on the `StorageClass.parameters` map. PVCs without that parameter use the
+top-level (default) StorageClassConfig.
 
 The target OS is resolved at dispatch time from the node's `kubernetes.io/os`
 label. Linux is the implicit default for unlabelled nodes.
@@ -107,6 +110,31 @@ label. Linux is the implicit default for unlabelled nodes.
 
 Windows entries accept either a single string (whitespace-tokenized) or an
 array of argv tokens (preferred — handles paths containing spaces).
+
+### Per-StorageClass override
+
+```jsonc
+{
+  // top-level defaults apply when storageClassConfigs is empty OR when a
+  // PVC's StorageClass does not set parameters["storageClassConfig"].
+  "setupCommand": "/usr/local/sbin/setup.sh",
+
+  "storageClassConfigs": {
+    "fast": {
+      "nodePathMap": [{"node": "DEFAULT_PATH_FOR_NON_LISTED_NODES", "paths": ["/mnt/fast"]}],
+      "setupCommand":    "/opt/fast-setup.sh",
+      "snapshotCommand": "/opt/fast-snapshot.sh",
+      "windows": {
+        "setupCommand": ["pwsh", "-File", "C:\\opt\\fast-setup.ps1"]
+      }
+    }
+  }
+}
+```
+
+A PVC requesting `parameters.storageClassConfig=fast` gets the per-SC
+commands above; actions without a per-SC entry (e.g. `teardown` here) fall
+through to the top-level overrides and then to the built-in defaults.
 
 ### Replacing a single hook
 

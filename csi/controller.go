@@ -242,7 +242,6 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	// volume directory and then applies quota.
 	action := lpp.HelperAction{
 		Type: lpp.ActionTypeCreate,
-		Cmd:  cs.provisioner.SetupCommand(),
 		Volume: lpp.VolumeOptions{
 			Name:        pvName,
 			Path:        path,
@@ -255,7 +254,6 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	if srcSnapshot != nil {
 		action.Type = lpp.ActionTypeRestore
-		action.Cmd = cs.provisioner.RestoreCommand()
 		action.Volume.SnapDir = srcSnapshot.SnapshotPath
 		if quotaType == "" {
 			action.Volume.QuotaType = srcSnapshot.QuotaType
@@ -349,7 +347,6 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		}
 	}
 
-	teardownCmd := cs.provisioner.TeardownCommand()
 	storage := pv.Spec.Capacity[v1.ResourceStorage]
 	mode := v1.PersistentVolumeFilesystem
 	if pv.Spec.VolumeMode != nil {
@@ -357,7 +354,6 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	}
 	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
 		Type: lpp.ActionTypeDelete,
-		Cmd:  teardownCmd,
 		Volume: lpp.VolumeOptions{
 			Name:        pv.Name,
 			Path:        path,
@@ -470,7 +466,6 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 	}
 	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
 		Type: lpp.ActionTypeResize,
-		Cmd:  cs.provisioner.ResizeCommand(),
 		Volume: lpp.VolumeOptions{
 			Name:        pv.Name,
 			Path:        path,
@@ -653,7 +648,6 @@ func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 
 	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
 		Type: lpp.ActionTypeSnapshot,
-		Cmd:  cs.provisioner.SnapshotCommand(),
 		Volume: lpp.VolumeOptions{
 			Name:        req.Name,
 			Path:        sourcePath,
@@ -730,7 +724,6 @@ func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 	}
 	if err := cs.provisioner.RunHelperPod(ctx, lpp.HelperAction{
 		Type: lpp.ActionTypeDeleteSnapshot,
-		Cmd:  cs.provisioner.SnapshotCommand(),
 		Volume: lpp.VolumeOptions{
 			Name:      name,
 			Path:      filepath.Dir(snapPath), // a real dir under <basePath>; VOL_DIR is unused by delete-snapshot

@@ -6,7 +6,7 @@
 #
 # env: VOL_DIR VOL_SIZE_BYTES VOL_QUOTA_TYPE
 
-. C:\opt\local-path-provisioner\common.ps1
+. C:\opt\local-path-csi-scripts\common.ps1
 
 $action = 'resize'
 for ($i = 0; $i -lt $args.Count; $i++) {

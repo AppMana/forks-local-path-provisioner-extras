@@ -23,6 +23,10 @@ data:
       "snapshotCommand": "/usr/local/sbin/snapshot.sh",
       "restoreCommand": "/usr/local/sbin/restore.sh"
     }
+  # Linux helper-pod template. Scheduled on the target Linux node by the
+  # controller. Privileged because the xfs/ext4 project-quota branches
+  # write to /etc/projects + /etc/projid and call xfs_quota / setquota /
+  # chattr +P.
   helperPod.yaml: |
     apiVersion: v1
     kind: Pod
@@ -38,8 +42,6 @@ data:
         - name: helper-pod
           image: ghcr.io/appmana/local-path-helper:latest
           imagePullPolicy: IfNotPresent
-          # Required for the xfs/ext4 project-quota branches: writable
-          # /etc/projects + /etc/projid, /dev (xfs_quota), /var/lock (flock).
           securityContext:
             privileged: true
           volumeMounts:
@@ -67,3 +69,28 @@ data:
           hostPath:
             path: /run/local-path-csi
             type: DirectoryOrCreate
+  # Windows helper-pod template. HostProcess container (k8s >= 1.23) — runs
+  # as the host's NT AUTHORITY\SYSTEM with direct access to the node
+  # filesystem, so no hostPath mounts are needed and FSRM cmdlets work
+  # against on-disk dirs natively. The image must include the
+  # FS-Resource-Manager Windows feature (servercore base, not nanoserver).
+  helperPod-windows.yaml: |
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: helper-pod
+    spec:
+      priorityClassName: system-node-critical
+      securityContext:
+        windowsOptions:
+          hostProcess: true
+          runAsUserName: "NT AUTHORITY\\SYSTEM"
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: windows
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: helper-pod
+          image: ghcr.io/appmana/local-path-helper:latest
+          imagePullPolicy: IfNotPresent

@@ -2,7 +2,7 @@
 #
 # env: VOL_DIR VOL_SIZE_BYTES VOL_MODE VOL_QUOTA_TYPE
 
-. C:\opt\local-path-provisioner\common.ps1
+. C:\opt\local-path-csi-scripts\common.ps1
 
 if (-not $env:VOL_DIR) { Die "VOL_DIR not set" }
 New-Item -ItemType Directory -Force -Path $env:VOL_DIR | Out-Null

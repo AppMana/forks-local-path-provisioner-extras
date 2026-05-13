@@ -13,7 +13,7 @@
 #          (point-in-time, crash-consistent). Falls back to a plain copy if
 #          VSS is unavailable (e.g. client SKU, no Volume Shadow Copy service).
 
-. C:\opt\local-path-provisioner\common.ps1
+. C:\opt\local-path-csi-scripts\common.ps1
 
 $action = 'snapshot'
 for ($i = 0; $i -lt $args.Count; $i++) {

@@ -8,6 +8,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// OS labels used in node.metadata.labels[kubernetes.io/os] and as keys into
+// the per-OS helper-pod template / command maps.
+const (
+	OSLinux   = "linux"
+	OSWindows = "windows"
+)
+
 const (
 	DefaultNodeAffinityKey    = "kubernetes.io/hostname"
 	NodeDefaultNonListedNodes = "DEFAULT_PATH_FOR_NON_LISTED_NODES"
@@ -79,8 +86,51 @@ type ConfigData struct {
 	ResizeCommand     string `json:"resizeCommand,omitempty"`
 	SnapshotCommand   string `json:"snapshotCommand,omitempty"`
 	RestoreCommand    string `json:"restoreCommand,omitempty"`
+	// Windows holds per-OS overrides used when the helper pod runs on a
+	// node labelled kubernetes.io/os=windows. Each command may be a single
+	// string (the whole argv as a shell line, split on whitespace) or an
+	// array. When nil or empty, the controller falls back to the built-in
+	// Windows defaults baked into the helper image.
+	Windows *WindowsConfigData `json:"windows,omitempty"`
 	StorageClassConfigData
 	StorageClassConfigs map[string]StorageClassConfigData `json:"storageClassConfigs"`
+}
+
+// WindowsConfigData mirrors the top-level command paths for Windows nodes.
+// Empty values inherit the controller's per-OS defaults.
+type WindowsConfigData struct {
+	SetupCommand    StringOrArray `json:"setupCommand,omitempty"`
+	TeardownCommand StringOrArray `json:"teardownCommand,omitempty"`
+	ResizeCommand   StringOrArray `json:"resizeCommand,omitempty"`
+	SnapshotCommand StringOrArray `json:"snapshotCommand,omitempty"`
+	RestoreCommand  StringOrArray `json:"restoreCommand,omitempty"`
+}
+
+// StringOrArray decodes either "powershell -File foo.ps1" (split on spaces)
+// or ["powershell", "-File", "foo.ps1"] (already split). The array form is
+// the preferred shape because it doesn't tokenize paths containing spaces.
+type StringOrArray []string
+
+func (s *StringOrArray) UnmarshalJSON(b []byte) error {
+	trimmed := strings.TrimSpace(string(b))
+	if len(trimmed) == 0 || trimmed == "null" {
+		*s = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var arr []string
+		if err := json.Unmarshal(b, &arr); err != nil {
+			return err
+		}
+		*s = arr
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(b, &str); err != nil {
+		return err
+	}
+	*s = strings.Fields(str)
+	return nil
 }
 
 type PathConfig struct {
@@ -105,6 +155,17 @@ type Config struct {
 	ResizeCommand     string
 	SnapshotCommand   string
 	RestoreCommand    string
+	Windows           *WindowsConfig
 	StorageClassConfig
 	StorageClassConfigs map[string]StorageClassConfig
+}
+
+// WindowsConfig is the canonicalized per-OS command overrides. Empty
+// fields fall back to the per-OS defaults baked into the controller.
+type WindowsConfig struct {
+	SetupCommand    []string
+	TeardownCommand []string
+	ResizeCommand   []string
+	SnapshotCommand []string
+	RestoreCommand  []string
 }

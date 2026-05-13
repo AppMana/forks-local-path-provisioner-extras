@@ -198,9 +198,13 @@ func TestProvisioner_InitCapacityTracker_FromLegacyHostPathPV(t *testing.T) {
 
 func TestProvisioner_DefaultCommands(t *testing.T) {
 	p := newTestProvisioner(t, `{"nodePathMap":[{"node":"n","paths":["/a"]}]}`)
-	assert.Equal(t, []string{"/bin/sh", "/script/setup"}, p.SetupCommand())
-	assert.Equal(t, []string{"/bin/sh", "/script/teardown"}, p.TeardownCommand())
-	assert.Equal(t, []string{"/bin/sh", "/script/resize"}, p.ResizeCommand())
+	// Defaults now point at the helper image's /usr/local/sbin scripts;
+	// the legacy /script/* configmap-mount fallback path is exercised
+	// only when a script is missing from config AND the helper pod
+	// template requests a configmap mount.
+	assert.Equal(t, []string{"/usr/local/sbin/setup.sh"}, p.SetupCommand())
+	assert.Equal(t, []string{"/usr/local/sbin/teardown.sh"}, p.TeardownCommand())
+	assert.Equal(t, []string{"/usr/local/sbin/resize.sh"}, p.ResizeCommand())
 }
 
 func TestProvisioner_OverrideCommands(t *testing.T) {

@@ -57,6 +57,15 @@ func CanonicalizeConfig(data *ConfigData) (*Config, error) {
 	cfg.ResizeCommand = data.ResizeCommand
 	cfg.SnapshotCommand = data.SnapshotCommand
 	cfg.RestoreCommand = data.RestoreCommand
+	if data.Windows != nil {
+		cfg.Windows = &WindowsConfig{
+			SetupCommand:    data.Windows.SetupCommand,
+			TeardownCommand: data.Windows.TeardownCommand,
+			ResizeCommand:   data.Windows.ResizeCommand,
+			SnapshotCommand: data.Windows.SnapshotCommand,
+			RestoreCommand:  data.Windows.RestoreCommand,
+		}
+	}
 	if data.CmdTimeoutSeconds > 0 {
 		cfg.CmdTimeoutSeconds = data.CmdTimeoutSeconds
 	} else {

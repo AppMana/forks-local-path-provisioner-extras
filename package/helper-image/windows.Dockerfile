@@ -12,8 +12,12 @@ SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop';
 
 RUN Install-WindowsFeature -Name FS-FileServer, FS-Resource-Manager -IncludeManagementTools
 
+# Scripts live in C:\opt\local-path-csi-scripts\ — NOT C:\opt\local-path-provisioner\.
+# The helper pod mounts the volume's parent dir at /opt/local-path-provisioner
+# via hostPath; collocating the scripts there would shadow them on Linux,
+# and we keep the two image layouts symmetric to dodge surprises.
 COPY scripts\common.ps1 scripts\setup.ps1 scripts\teardown.ps1 scripts\resize.ps1 `
      scripts\snapshot.ps1 scripts\restore.ps1 `
-     C:/opt/local-path-provisioner/
+     C:/opt/local-path-csi-scripts/
 
-WORKDIR C:/opt/local-path-provisioner
+WORKDIR C:/opt/local-path-csi-scripts

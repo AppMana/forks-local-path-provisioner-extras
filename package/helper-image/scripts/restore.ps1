@@ -3,7 +3,7 @@
 #
 # env: SNAP_DIR (source) VOL_DIR (new volume) VOL_SIZE_BYTES VOL_QUOTA_TYPE
 
-. C:\opt\local-path-provisioner\common.ps1
+. C:\opt\local-path-csi-scripts\common.ps1
 
 if (-not $env:SNAP_DIR) { Die "SNAP_DIR not set" }
 if (-not $env:VOL_DIR)  { Die "VOL_DIR not set" }

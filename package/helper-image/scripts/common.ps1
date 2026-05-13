@@ -1,6 +1,6 @@
 # common.ps1 - shared helpers for the Windows local-path helper scripts.
 #
-# Sourced (. C:\opt\local-path-provisioner\common.ps1) by setup/teardown/
+# Sourced (. C:\opt\local-path-csi-scripts\common.ps1) by setup/teardown/
 # resize/snapshot/restore.
 #
 # Env vars from the CSI controller: VOL_DIR VOL_SIZE_BYTES VOL_MODE
@@ -80,19 +80,20 @@ function Assert-FsrmAvailable {
     Import-Module FileServerResourceManager -ErrorAction Stop
 }
 
-# Set-FsrmHardQuota creates or updates an FSRM hard byte quota on $Path. Hard
-# quotas reject writes that would exceed the limit (the default FSRM template
-# behavior with -SoftLimit:$false, which is the New-FsrmQuota default).
+# Set-FsrmHardQuota creates or updates an FSRM HARD byte quota on $Path.
+# Hard quotas reject writes that would exceed the limit. The Windows Server
+# 2022 FSRM cmdlets default to soft limits despite the docs saying
+# otherwise; explicitly pass -SoftLimit:$false on both create and update.
 function Set-FsrmHardQuota([string]$Path, [int64]$SizeBytes) {
     Assert-FsrmAvailable
     try {
         $existing = Get-FsrmQuota -Path $Path -ErrorAction SilentlyContinue
         if ($existing) {
-            Set-FsrmQuota -Path $Path -Size $SizeBytes -ErrorAction Stop | Out-Null
+            Set-FsrmQuota -Path $Path -Size $SizeBytes -SoftLimit:$false -ErrorAction Stop | Out-Null
         } else {
-            New-FsrmQuota -Path $Path -Size $SizeBytes -Description "local-path-provisioner" -ErrorAction Stop | Out-Null
+            New-FsrmQuota -Path $Path -Size $SizeBytes -SoftLimit:$false -Description "local-path-provisioner" -ErrorAction Stop | Out-Null
         }
-        Get-FsrmQuota -Path $Path | Format-List Path, Size, Usage
+        Get-FsrmQuota -Path $Path | Format-List Path, Size, Usage, SoftLimit
     } catch {
         Die "FSRM quota operation failed for $Path : $($_.Exception.Message)"
     }

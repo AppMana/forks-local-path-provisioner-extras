@@ -54,14 +54,15 @@ type Provisioner struct {
 	helperImage        string
 	serviceAccountName string
 
-	config          *Config
-	configData      *ConfigData
-	configFile      string
-	configMapName   string
-	configMutex     *sync.RWMutex
-	helperPod       *v1.Pod
-	capacityTracker *CapacityTracker
-	snapshotTracker *SnapshotTracker
+	config            *Config
+	configData        *ConfigData
+	configFile        string
+	configMapName     string
+	configMutex       *sync.RWMutex
+	helperPod         *v1.Pod
+	helperPodWindows  *v1.Pod
+	capacityTracker   *CapacityTracker
+	snapshotTracker   *SnapshotTracker
 
 	// runHelperPodFn is the helper-pod dispatch hook. nil means "use the
 	// real implementation". Tests inject a fake via SetRunHelperPodFn.
@@ -116,58 +117,133 @@ func NewProvisioner(
 // KubeClient returns the underlying Kubernetes clientset.
 func (p *Provisioner) KubeClient() clientset.Interface { return p.kubeClient }
 
+// SetWindowsHelperPodTemplate registers the per-Windows-node helper-pod
+// template (must be a HostProcess pod spec). Called from main.go after
+// NewProvisioner when the ConfigMap carries a helperPod-windows.yaml key.
+// Returns the parse error if the YAML doesn't describe a valid pod; on
+// nil/empty input clears any previously-set template.
+func (p *Provisioner) SetWindowsHelperPodTemplate(yamlText string) error {
+	if strings.TrimSpace(yamlText) == "" {
+		p.configMutex.Lock()
+		p.helperPodWindows = nil
+		p.configMutex.Unlock()
+		return nil
+	}
+	pod, err := LoadHelperPodFile(yamlText)
+	if err != nil {
+		return err
+	}
+	p.configMutex.Lock()
+	p.helperPodWindows = pod
+	p.configMutex.Unlock()
+	return nil
+}
+
+// HasWindowsHelperPodTemplate reports whether a Windows template was
+// registered. Used by tests and by the controller when picking a node OS.
+func (p *Provisioner) HasWindowsHelperPodTemplate() bool {
+	p.configMutex.RLock()
+	defer p.configMutex.RUnlock()
+	return p.helperPodWindows != nil
+}
+
 // Namespace returns the namespace the provisioner runs helper pods into.
 func (p *Provisioner) Namespace() string { return p.namespace }
 
-// SetupCommand returns the configured setup command, or the default if unset.
-func (p *Provisioner) SetupCommand() []string {
+// Defaults baked into the helper images. The Linux variants are direct
+// invocations of the helper scripts the linux.Dockerfile drops at
+// /usr/local/sbin/; the Windows variants invoke powershell with -File so
+// the .ps1 scripts the windows.Dockerfile drops at
+// C:\opt\local-path-csi-scripts\ run from the helper-pod image (HostProcess
+// containers see them at $env:CONTAINER_SANDBOX_MOUNT_POINT, but the
+// powershell -File arg accepts the in-image absolute path).
+var (
+	defaultLinuxCommands = map[ActionType][]string{
+		ActionTypeCreate:         {"/usr/local/sbin/setup.sh"},
+		ActionTypeDelete:         {"/usr/local/sbin/teardown.sh"},
+		ActionTypeResize:         {"/usr/local/sbin/resize.sh"},
+		ActionTypeSnapshot:       {"/usr/local/sbin/snapshot.sh"},
+		ActionTypeDeleteSnapshot: {"/usr/local/sbin/snapshot.sh"},
+		ActionTypeRestore:        {"/usr/local/sbin/restore.sh"},
+	}
+	defaultWindowsCommands = map[ActionType][]string{
+		ActionTypeCreate:         {"powershell", "-NoProfile", "-File", "C:\\opt\\local-path-csi-scripts\\setup.ps1"},
+		ActionTypeDelete:         {"powershell", "-NoProfile", "-File", "C:\\opt\\local-path-csi-scripts\\teardown.ps1"},
+		ActionTypeResize:         {"powershell", "-NoProfile", "-File", "C:\\opt\\local-path-csi-scripts\\resize.ps1"},
+		ActionTypeSnapshot:       {"powershell", "-NoProfile", "-File", "C:\\opt\\local-path-csi-scripts\\snapshot.ps1"},
+		ActionTypeDeleteSnapshot: {"powershell", "-NoProfile", "-File", "C:\\opt\\local-path-csi-scripts\\snapshot.ps1"},
+		ActionTypeRestore:        {"powershell", "-NoProfile", "-File", "C:\\opt\\local-path-csi-scripts\\restore.ps1"},
+	}
+)
+
+// commandFor returns the command to invoke for (action, osType). Config
+// overrides take precedence; missing values fall back to per-OS defaults.
+// The caller holds no locks — this method takes configMutex internally.
+func (p *Provisioner) commandFor(action ActionType, osType string) []string {
 	p.configMutex.RLock()
 	defer p.configMutex.RUnlock()
-	if p.config != nil && p.config.SetupCommand != "" {
-		return []string{p.config.SetupCommand}
+	if osType == OSWindows {
+		if p.config != nil && p.config.Windows != nil {
+			switch action {
+			case ActionTypeCreate:
+				if len(p.config.Windows.SetupCommand) > 0 {
+					return p.config.Windows.SetupCommand
+				}
+			case ActionTypeDelete:
+				if len(p.config.Windows.TeardownCommand) > 0 {
+					return p.config.Windows.TeardownCommand
+				}
+			case ActionTypeResize:
+				if len(p.config.Windows.ResizeCommand) > 0 {
+					return p.config.Windows.ResizeCommand
+				}
+			case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
+				if len(p.config.Windows.SnapshotCommand) > 0 {
+					return p.config.Windows.SnapshotCommand
+				}
+			case ActionTypeRestore:
+				if len(p.config.Windows.RestoreCommand) > 0 {
+					return p.config.Windows.RestoreCommand
+				}
+			}
+		}
+		return append([]string(nil), defaultWindowsCommands[action]...)
 	}
-	return []string{"/bin/sh", "/script/setup"}
+	if p.config != nil {
+		switch action {
+		case ActionTypeCreate:
+			if p.config.SetupCommand != "" {
+				return []string{p.config.SetupCommand}
+			}
+		case ActionTypeDelete:
+			if p.config.TeardownCommand != "" {
+				return []string{p.config.TeardownCommand}
+			}
+		case ActionTypeResize:
+			if p.config.ResizeCommand != "" {
+				return []string{p.config.ResizeCommand}
+			}
+		case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
+			if p.config.SnapshotCommand != "" {
+				return []string{p.config.SnapshotCommand}
+			}
+		case ActionTypeRestore:
+			if p.config.RestoreCommand != "" {
+				return []string{p.config.RestoreCommand}
+			}
+		}
+	}
+	return append([]string(nil), defaultLinuxCommands[action]...)
 }
 
-// TeardownCommand returns the configured teardown command, or the default.
-func (p *Provisioner) TeardownCommand() []string {
-	p.configMutex.RLock()
-	defer p.configMutex.RUnlock()
-	if p.config != nil && p.config.TeardownCommand != "" {
-		return []string{p.config.TeardownCommand}
-	}
-	return []string{"/bin/sh", "/script/teardown"}
-}
-
-// ResizeCommand returns the configured resize command, or the default.
-func (p *Provisioner) ResizeCommand() []string {
-	p.configMutex.RLock()
-	defer p.configMutex.RUnlock()
-	if p.config != nil && p.config.ResizeCommand != "" {
-		return []string{p.config.ResizeCommand}
-	}
-	return []string{"/bin/sh", "/script/resize"}
-}
-
-// SnapshotCommand returns the configured snapshot command, or the default.
-func (p *Provisioner) SnapshotCommand() []string {
-	p.configMutex.RLock()
-	defer p.configMutex.RUnlock()
-	if p.config != nil && p.config.SnapshotCommand != "" {
-		return []string{p.config.SnapshotCommand}
-	}
-	return []string{"/usr/local/sbin/snapshot.sh"}
-}
-
-// RestoreCommand returns the configured restore command, or the default.
-func (p *Provisioner) RestoreCommand() []string {
-	p.configMutex.RLock()
-	defer p.configMutex.RUnlock()
-	if p.config != nil && p.config.RestoreCommand != "" {
-		return []string{p.config.RestoreCommand}
-	}
-	return []string{"/usr/local/sbin/restore.sh"}
-}
+// SetupCommand / TeardownCommand / ResizeCommand / SnapshotCommand /
+// RestoreCommand are kept as shims for tests and external callers that
+// don't yet pass an osType. They return the Linux command.
+func (p *Provisioner) SetupCommand() []string    { return p.commandFor(ActionTypeCreate, OSLinux) }
+func (p *Provisioner) TeardownCommand() []string { return p.commandFor(ActionTypeDelete, OSLinux) }
+func (p *Provisioner) ResizeCommand() []string   { return p.commandFor(ActionTypeResize, OSLinux) }
+func (p *Provisioner) SnapshotCommand() []string { return p.commandFor(ActionTypeSnapshot, OSLinux) }
+func (p *Provisioner) RestoreCommand() []string  { return p.commandFor(ActionTypeRestore, OSLinux) }
 
 // SnapshotTracker exposes the in-memory snapshot index.
 func (p *Provisioner) SnapshotTracker() *SnapshotTracker { return p.snapshotTracker }
@@ -402,14 +478,27 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 	if o.Name == "" || o.Path == "" || (!sharedFS && o.Node == "") {
 		return fmt.Errorf("invalid empty name or path or node")
 	}
-	if !filepath.IsAbs(o.Path) {
-		return fmt.Errorf("volume path %s is not absolute", o.Path)
+	// Use filepath.IsAbs but allow Windows-flavored paths (e.g. C:\data\...)
+	// when the target node is Windows; filepath.IsAbs on a Linux build does
+	// not recognize a drive prefix as absolute.
+	osType := p.resolveTargetOS(ctx, o.Node)
+	if !pathIsAbsForOS(o.Path, osType) {
+		return fmt.Errorf("volume path %s is not absolute for %s", o.Path, osType)
 	}
-	o.Path = filepath.Clean(o.Path)
-	parentDir, volumeDir := filepath.Split(o.Path)
+	o.Path = cleanPathForOS(o.Path, osType)
+	parentDir, volumeDir := splitPathForOS(o.Path, osType)
 	hostPathType := v1.HostPathDirectoryOrCreate
 
-	helperPod := p.helperPod.DeepCopy()
+	template := p.helperPod
+	if osType == OSWindows {
+		p.configMutex.RLock()
+		template = p.helperPodWindows
+		p.configMutex.RUnlock()
+		if template == nil {
+			return fmt.Errorf("node %s is Windows but no Windows helper-pod template is configured (set helperPod-windows.yaml in the ConfigMap)", o.Node)
+		}
+	}
+	helperPod := template.DeepCopy()
 	lpvVolumes := []v1.Volume{{
 		Name: helperDataVolName,
 		VolumeSource: v1.VolumeSource{
@@ -417,15 +506,21 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 		},
 	}}
 
+	// Configmap-script fallback only applies to Linux helper pods. On
+	// Windows, scripts ship with the helper image (HostProcess containers
+	// access them via $env:CONTAINER_SANDBOX_MOUNT_POINT or the in-image
+	// absolute path); the controller's command picker handles them.
 	keyToPathItems := []v1.KeyToPath{}
-	if p.config.SetupCommand == "" {
-		keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "setup", Path: "setup"})
-	}
-	if p.config.TeardownCommand == "" {
-		keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "teardown", Path: "teardown"})
-	}
-	if p.config.ResizeCommand == "" {
-		keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "resize", Path: "resize"})
+	if osType != OSWindows {
+		if p.config.SetupCommand == "" {
+			keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "setup", Path: "setup"})
+		}
+		if p.config.TeardownCommand == "" {
+			keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "teardown", Path: "teardown"})
+		}
+		if p.config.ResizeCommand == "" {
+			keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "resize", Path: "resize"})
+		}
 	}
 	if len(keyToPathItems) > 0 {
 		lpvVolumes = append(lpvVolumes, v1.Volume{
@@ -448,7 +543,7 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 	}
 
 	env := []v1.EnvVar{
-		{Name: envVolDir, Value: filepath.Join(parentDir, volumeDir)},
+		{Name: envVolDir, Value: joinPathForOS(osType, parentDir, volumeDir)},
 		{Name: envVolMode, Value: string(o.Mode)},
 		{Name: envVolSize, Value: strconv.FormatInt(o.SizeInBytes, 10)},
 		{Name: envVolQuotaType, Value: o.QuotaType},
@@ -457,6 +552,10 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 		env = append(env, v1.EnvVar{Name: envSnapDir, Value: o.SnapDir})
 	}
 
+	cmd := a.Cmd
+	if len(cmd) == 0 {
+		cmd = p.commandFor(a.Type, osType)
+	}
 	helperPod.Name = helperPod.Name + "-" + string(a.Type) + "-" + o.Name
 	if len(helperPod.Name) > HelperPodNameMaxLength {
 		helperPod.Name = helperPod.Name[:HelperPodNameMaxLength]
@@ -473,10 +572,10 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 		})
 	}
 	helperPod.Spec.Volumes = append(helperPod.Spec.Volumes, lpvVolumes...)
-	helperPod.Spec.Containers[0].Command = a.Cmd
+	helperPod.Spec.Containers[0].Command = cmd
 	helperPod.Spec.Containers[0].Env = append(helperPod.Spec.Containers[0].Env, env...)
 	helperPod.Spec.Containers[0].Args = []string{
-		"-p", filepath.Join(parentDir, volumeDir),
+		"-p", joinPathForOS(osType, parentDir, volumeDir),
 		"-s", strconv.FormatInt(o.SizeInBytes, 10),
 		"-m", string(o.Mode),
 		"-a", string(a.Type),

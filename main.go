@@ -45,7 +45,8 @@ const (
 	defaultHelperImage        = "ghcr.io/appmana/local-path-helper:latest"
 	defaultServiceAccountName = "local-path-provisioner-service-account"
 	defaultConfigFileKey      = "config.json"
-	defaultHelperPodFileKey   = "helperPod.yaml"
+	defaultHelperPodFileKey        = "helperPod.yaml"
+	defaultHelperPodWindowsFileKey = "helperPod-windows.yaml"
 )
 
 func main() {
@@ -113,6 +114,16 @@ func runController(ctx context.Context) error {
 	prov, err := lpp.NewProvisioner(ctx, kc, configFile, ns, helperImage, *flagConfigMapName, saName, helperPodYaml)
 	if err != nil {
 		return fmt.Errorf("new provisioner: %v", err)
+	}
+	// Optional Windows helper-pod template. Missing the configmap key is
+	// fine — that just means the controller won't dispatch to Windows
+	// nodes (RunHelperPod surfaces a clear error if it tries).
+	if windowsYaml, err := readConfigMapKey(kc, ns, *flagConfigMapName, defaultHelperPodWindowsFileKey); err == nil {
+		if err := prov.SetWindowsHelperPodTemplate(windowsYaml); err != nil {
+			logrus.Warnf("invalid %s in ConfigMap %s/%s: %v", defaultHelperPodWindowsFileKey, ns, *flagConfigMapName, err)
+		} else {
+			logrus.Infof("loaded Windows helper-pod template from %s", defaultHelperPodWindowsFileKey)
+		}
 	}
 
 	srv := csi.NewServer(*flagEndpoint, csi.NewIdentityServer(), csi.NewControllerServer(prov), nil)

@@ -45,7 +45,18 @@ if (Test-Path $env:SNAP_DIR) {
             Copy-Item -Recurse -Force $env:VOL_DIR $env:SNAP_DIR
         }
         'NTFS' {
+            # VSS produces a point-in-time, crash-consistent shadow of the
+            # source volume. The shadow's DeviceObject ("\\?\GLOBALROOT\Device\
+            # HarddiskVolumeShadowCopyN") is a device-object path which many
+            # Win32 callers (robocopy, Test-Path, File.Exists) handle
+            # inconsistently and which is unstable across rapid create/delete
+            # cycles. The canonical workaround documented by Microsoft is to
+            # expose the shadow through a directory symbolic link (mklink /D)
+            # and read through the link. Win32 path APIs follow the reparse
+            # point correctly and the shadow's contents become visible.
             $done = $false
+            $shadow = $null
+            $mount = $null
             try {
                 $drive = Resolve-VolumeDriveLetter $env:VOL_DIR
                 if (-not $drive) { throw "could not resolve drive letter for $($env:VOL_DIR)" }
@@ -55,19 +66,39 @@ if (Test-Path $env:SNAP_DIR) {
                 if ($res.ReturnValue -ne 0) { throw "Win32_ShadowCopy.Create returned $($res.ReturnValue)" }
                 $shadow = Get-CimInstance Win32_ShadowCopy | Where-Object { $_.ID -eq $res.ShadowID }
                 if (-not $shadow) { throw "shadow copy $($res.ShadowID) not found after Create" }
-                try {
-                    $devicePath = $shadow.DeviceObject.TrimEnd('\') + '\'
-                    $rel = $env:VOL_DIR.Substring(3)  # strip "X:\"
-                    $src = Join-Path $devicePath $rel
-                    Write-Log "NTFS: robocopy $src -> $($env:SNAP_DIR)"
-                    robocopy $src $env:SNAP_DIR /MIR /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
-                    if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
-                    $done = $true
-                } finally {
-                    $shadow.Delete() 2>$null
+                # mklink requires a trailing backslash on the target so it
+                # treats the device-object path as a directory.
+                $deviceTarget = $shadow.DeviceObject.TrimEnd('\') + '\'
+                $mount = Join-Path $env:TEMP ("lpp-vss-" + [System.Guid]::NewGuid().ToString("N"))
+                $mkOut = cmd /c "mklink /D `"$mount`" `"$deviceTarget`"" 2>&1
+                if ($LASTEXITCODE -ne 0 -or -not (Test-Path $mount)) {
+                    throw "mklink /D $mount -> $deviceTarget failed: $mkOut"
                 }
+                $rel = $env:VOL_DIR.Substring(3)  # strip "X:\"
+                $src = Join-Path $mount $rel
+                if (-not (Test-Path $src)) { throw "shadow does not contain $src" }
+                Write-Log "NTFS: robocopy $src -> $($env:SNAP_DIR)"
+                robocopy $src $env:SNAP_DIR /MIR /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
+                # robocopy exit codes 0..7 are success-ish (files copied,
+                # no-op, mismatched, extras), >= 8 is a real failure.
+                if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
+                $done = $true
             } catch {
                 Write-Log "WARNING: NTFS VSS snapshot failed ($($_.Exception.Message)); falling back to a plain copy (not point-in-time)"
+            } finally {
+                # Drop the symlink first, then the shadow copy. Removing a
+                # directory symbolic link via Remove-Item -Recurse deletes the
+                # link target's contents on older PowerShell versions, so use
+                # cmd /c rmdir which only removes the link.
+                if ($mount -and (Test-Path $mount)) {
+                    cmd /c "rmdir `"$mount`"" 2>&1 | Out-Null
+                }
+                if ($shadow) {
+                    # CimInstance has no .Delete() method (that's the legacy
+                    # ManagementObject API on Get-WmiObject); use
+                    # Remove-CimInstance instead.
+                    Remove-CimInstance -InputObject $shadow -ErrorAction SilentlyContinue
+                }
             }
             if (-not $done) {
                 Copy-Item -Recurse -Force $env:VOL_DIR $env:SNAP_DIR

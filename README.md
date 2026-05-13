@@ -374,6 +374,19 @@ kubectl apply -f debug/config.yaml
 kubectl delete -f debug/config.yaml
 ```
 
+## Further docs
+
+- [`docs/hook-scripts.md`](docs/hook-scripts.md) — the contract every helper-pod
+  script honors (env vars, args, exit codes), the override matrix, and the
+  table of built-in defaults per filesystem.
+- [`docs/snapshots.md`](docs/snapshots.md) — per-filesystem snapshot mechanics:
+  btrfs / xfs reflink on Linux, VSS+mklink on NTFS, block clone on ReFS.
+- [`docs/windows-fsrm.md`](docs/windows-fsrm.md) — FSRM hard quotas only
+  enforce on non-system paths; operator note for picking a Windows `nodePath`.
+- [`docs/windows-e2e.md`](docs/windows-e2e.md) — qemu Windows Server 2022 lab
+  VM bringup for snapshot / quota / resize iteration.
+- [`docs/plan.md`](docs/plan.md) — implementation plan for the CSI fork.
+
 ## License
 
 Copyright (c) 2014-2020  [Rancher Labs, Inc.](http://rancher.com/)

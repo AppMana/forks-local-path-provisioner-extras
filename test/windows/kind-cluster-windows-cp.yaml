@@ -1,0 +1,21 @@
+# kind cluster used as the Linux control plane that a qemu Windows VM joins.
+#
+# The qemu VM lives on br0 at 10.2.0.180 (see appmana-management's autoinstall
+# README). It needs to dial the kind API server, so we expose the API server
+# on the host's br0 IP rather than the default 127.0.0.1.
+#
+# Set APISERVER_ADDRESS to the host's br0 IP before `kind create cluster
+# --config=<this-file>`. Or hand-edit the address below.
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+networking:
+  apiServerAddress: 10.2.0.42      # host's br0 IP — the Windows VM dials this
+  apiServerPort: 6443
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.35.1
+    extraPortMappings:
+      - containerPort: 6443
+        hostPort: 6443
+        listenAddress: 10.2.0.42
+        protocol: TCP

@@ -1,0 +1,126 @@
+name: csi-e2e
+
+on:
+  push:
+    branches: [appmana-extras, master, main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  csi-e2e:
+    name: kind + CSI driver lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Install kind + kustomize
+        run: |
+          go install sigs.k8s.io/kind@v0.31.0
+          go install sigs.k8s.io/kustomize/kustomize/v5@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build driver image (linux/amd64)
+        run: |
+          docker build -t local-path-csi:e2e --build-arg VERSION=$GITHUB_SHA -f Dockerfile.runtime .
+
+      - name: Build helper image (linux/amd64)
+        run: |
+          docker build -t local-path-helper:e2e -f package/helper-image/linux.Dockerfile package/helper-image
+
+      - name: Run CSI e2e suite
+        env:
+          CSI_IMAGE: local-path-csi:e2e
+          HELPER_IMAGE: local-path-helper:e2e
+        run: go test -tags=e2e -v -timeout=20m -run TestCSIE2E ./test/
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          set +e
+          echo "=== Cluster info ==="
+          kubectl cluster-info --context kind-kind
+          echo
+          echo "=== All pods ==="
+          kubectl get pods -A -o wide
+          echo
+          echo "=== Controller logs ==="
+          kubectl -n local-path-storage logs deployment/local-path-csi-controller --all-containers --tail=200
+          echo
+          echo "=== Node DaemonSet logs ==="
+          for pod in $(kubectl -n local-path-storage get pods -l app=local-path-csi-node -o name); do
+            echo "--- $pod ---"
+            kubectl -n local-path-storage logs "$pod" --all-containers --tail=200
+          done
+          echo
+          echo "=== Helper pods (recent) ==="
+          kubectl -n local-path-storage get pods | grep helper-pod || true
+          echo
+          echo "=== PVs / PVCs / CSIStorageCapacity ==="
+          kubectl get pv,pvc -A
+          kubectl get csistoragecapacity -A -o wide || true
+          echo
+          echo "=== Events ==="
+          kubectl get events -A --sort-by=.lastTimestamp | tail -80
+
+      - name: kind delete
+        if: always()
+        run: kind delete cluster 2>/dev/null || true
+
+  csi-quota-e2e:
+    name: kind + CSI driver + loopback XFS (quota enforcement)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: System deps for XFS loopback
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs
+
+      - name: Create loopback XFS with prjquota
+        run: |
+          truncate -s 2G /tmp/xfs.img
+          sudo mkfs.xfs /tmp/xfs.img
+          sudo mkdir -p /tmp/xfs-mount
+          sudo mount -o loop,pquota /tmp/xfs.img /tmp/xfs-mount
+          sudo chmod 777 /tmp/xfs-mount
+          sudo touch /tmp/xfs-mount-projects /tmp/xfs-mount-projid
+          sudo chmod 666 /tmp/xfs-mount-projects /tmp/xfs-mount-projid
+          mount | grep xfs-mount
+
+      - name: Install kind + kustomize
+        run: |
+          go install sigs.k8s.io/kind@v0.31.0
+          go install sigs.k8s.io/kustomize/kustomize/v5@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build images
+        run: |
+          docker build -t local-path-csi:e2e --build-arg VERSION=$GITHUB_SHA -f Dockerfile.runtime .
+          docker build -t local-path-helper:e2e -f package/helper-image/linux.Dockerfile package/helper-image
+
+      - name: TODO csi-quota e2e suite
+        run: |
+          echo "Quota e2e against the new CSI driver lands here. The loopback XFS"
+          echo "filesystem is mounted at /tmp/xfs-mount with prjquota; the kind"
+          echo "cluster needs to be configured with that as the nodePath so the"
+          echo "xfs quota helper-pod branch is exercised. PR #558's existing"
+          echo "quota tests rebuilt for the CSI flow are M8.4."
+          ls /tmp/xfs-mount
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo umount /tmp/xfs-mount 2>/dev/null || true
+          sudo losetup -D 2>/dev/null || true

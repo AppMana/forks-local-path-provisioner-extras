@@ -65,9 +65,33 @@ only parse `-a` when they need to distinguish actions.
   `common.ps1` (which writes to stderr — PowerShell's stdout is captured into
   function return values, so logging there corrupts `$(Resolve-...)` returns).
 - **stdout** is reserved for action-specific structured output. Today that's
-  one case: `check-usage` MUST print a single decimal byte count followed by a
-  newline. Everything else should write to stderr to leave stdout for future
-  structured contracts.
+  one case: `check-usage` MUST print a line of the form `USAGE_BYTES=<n>`
+  followed by a newline. Everything else should write to stderr to leave
+  stdout for future structured contracts.
+
+### `check-usage` contract
+
+`check-usage` is the introspection sub-action of `resize`: the controller
+appends `-a check-usage` instead of `-a resize` when it wants to read the
+volume's current on-disk size without changing anything. The script MUST:
+
+1. Compute the byte size of `$VOL_DIR` (recursive, dereferenced).
+2. Print exactly one line to stdout: `USAGE_BYTES=<decimal>`. Empty / missing
+   directories return `USAGE_BYTES=0`.
+3. Write any log lines to stderr.
+4. Exit 0 unless the directory cannot be read.
+
+The shipped `resize.sh` uses `du -sb`. The shipped `resize.ps1` walks the
+tree with `Get-ChildItem -Recurse -Force | Measure-Object -Property Length
+-Sum`. Both have been validated to print exactly `USAGE_BYTES=12582912` for
+a directory holding a 12 MiB file.
+
+Today the controller calls `check-usage` only as a defense-in-depth gate;
+shrink requests on a PVC are rejected before the CSI driver sees them
+(`PersistentVolumeClaim … is invalid: spec.resources.requests.storage:
+Forbidden: field can not be less than status.capacity`). The script
+contract still has to hold so that a future shrink-enabled flow — or a
+manual CSI client call — can rely on it.
 
 ## Override matrix
 

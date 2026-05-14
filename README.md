@@ -1,9 +1,22 @@
-# Local Path Provisioner
-[![Go Report Card](https://goreportcard.com/badge/github.com/rancher/local-path-provisioner)](https://goreportcard.com/report/github.com/rancher/local-path-provisioner)
+# Local Path Provisioner — CSI fork (appmana-extras)
+
+This is `AppMana/forks-local-path-provisioner-extras`: a CSI rewrite of
+`rancher/local-path-provisioner` with per-filesystem quotas, snapshots,
+multi-OS dispatch, and capacity-aware scheduling. The upstream `master`
+branch's sig-storage-lib provisioner has been replaced by a real CSI
+driver (controller + node DaemonSet) so kubelet can publish
+`CSIStorageCapacity`, expand volumes through `ControllerExpandVolume`,
+and back snapshots with `VolumeSnapshot`/`VolumeSnapshotContent`.
 
 ## Overview
 
-Local Path Provisioner provides a way for the Kubernetes users to utilize the local storage in each node. Based on the user configuration, the Local Path Provisioner will create either `hostPath` or `local` based persistent volume on the node automatically. It utilizes the features introduced by Kubernetes [Local Persistent Volume feature](https://kubernetes.io/blog/2018/04/13/local-persistent-volumes-beta/), but makes it a simpler solution than the built-in `local` volume feature in Kubernetes.
+The driver provisions a `hostPath`-style PV on the selected node, runs
+short-lived helper pods to do the per-FS work (create directory, set
+quota, take snapshot, restore from snapshot, expand), and reports
+free-byte capacity to the scheduler so PVCs land on a node that can
+actually accommodate them. See [`docs/hook-scripts.md`](docs/hook-scripts.md)
+for the helper-pod contract and [`docs/snapshots.md`](docs/snapshots.md)
+for the per-FS snapshot mechanics.
 
 ## Compare to built-in Local Persistent Volume feature in Kubernetes
 
@@ -22,129 +35,113 @@ The provisioner supports three types of volume capacity enforcement:
 2. **Per-Path Capacity Budget** (provisioning-time check)
    Tracks total allocated bytes per `(node, path)` pair and rejects new PVCs that would exceed a path's `maxCapacity`. Configured in `config.json` `nodePathMap` using the object path format `{"path": "/mnt/data", "maxCapacity": "100Gi"}`. No special host requirements.
 
-3. **Filesystem-Level Quota Enforcement** (runtime enforcement via XFS project quotas)
-   Hard-limits the amount of data a pod can write to its PVC volume using XFS project quotas. If a pod writes beyond the PVC's requested size, it receives `ENOSPC` (No space left on device). Configured via StorageClass parameter `quotaEnforcement: xfs`.
+3. **Filesystem-Level Quota Enforcement** (runtime enforcement via per-FS quotas)
+   Hard-limits the amount of data a pod can write to its PVC volume. Writes
+   beyond the PVC's requested size return `ENOSPC`. The shipped helper image
+   covers xfs project quotas, ext4 project quotas, btrfs qgroups on Linux,
+   and FSRM hard quotas on Windows NTFS. Configured via
+   `quotaEnforcement: auto | xfs | ext4 | btrfs | ntfs | refs | none` on the
+   StorageClass. `auto` detects the filesystem at the configured node path.
 
-   **Requirements for filesystem-level enforcement:**
-   - The underlying storage path must be on an **XFS filesystem** mounted with the `prjquota` option
-   - Host must have `/etc/projects` and `/etc/projid` files (created via `touch`)
-   - The **quota-helper image** (`local-path-quota-helper`) must be used as the helper pod image, providing `xfsprogs` and `flock` for quota operations
-   - The helper pod runs as **privileged** with host mounts for `/etc/projects`, `/etc/projid`, `/dev`, and `/var/lock`
-   - The setup and teardown scripts in the ConfigMap must be replaced with the quota-aware versions from `package/quota-helper/`
+   **Requirements for filesystem-level enforcement on Linux:**
+   - xfs needs the volume's parent path on an xfs FS mounted with `prjquota`.
+   - ext4 needs `prjquota` mount option + `chattr +P` support (kernel 4.5+).
+   - btrfs needs qgroups enabled on the subvolume.
+   - Host must have `/etc/projects` and `/etc/projid` files (created via `touch`).
+   - The helper pod runs privileged with bind-mounts on those files.
 
-Features 1 and 2 work on any filesystem and require no special host setup. Feature 3 requires XFS with project quotas enabled.
+   **Windows:**
+   - The node must have the FS-Resource-Manager Windows feature installed
+     (`Install-WindowsFeature FS-Resource-Manager -IncludeManagementTools`).
+   - The `nodePath` MUST NOT live under `C:\Windows\…` or `C:\Program Files\…` —
+     FSRM silently demotes hard quotas to soft on system paths. See
+     [`docs/windows-fsrm.md`](docs/windows-fsrm.md).
 
 ## Requirement
-Kubernetes v1.12+.
+Kubernetes v1.24+. Snapshots require the external-snapshotter CRDs +
+snapshot-controller installed cluster-wide.
 
 ## Deployment
 
-### Installation
+### Helm chart (preferred)
 
-In this setup, the directory `/opt/local-path-provisioner` will be used across all the nodes as the path for provisioning (a.k.a, store the persistent volume data). The provisioner will be installed in `local-path-storage` namespace by default.
-
-- Stable
-```
-kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.35/deploy/local-path-storage.yaml
+```bash
+helm install lpp deploy/chart/local-path-csi \
+  --namespace local-path-storage --create-namespace
 ```
 
-- Development
-```
-kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+Disable snapshots (skips the csi-snapshotter sidecar + VolumeSnapshotClass)
+if the external-snapshotter CRDs are not installed:
+
+```bash
+helm install lpp deploy/chart/local-path-csi \
+  --namespace local-path-storage --create-namespace \
+  --set snapshots.enabled=false
 ```
 
-Or, use `kustomize` to deploy.
-- Stable
-```
-kustomize build "github.com/rancher/local-path-provisioner/deploy?ref=v0.0.35" | kubectl apply -f -
+Enable the Windows node DaemonSet on a mixed cluster:
+
+```bash
+helm install lpp deploy/chart/local-path-csi \
+  --namespace local-path-storage --create-namespace \
+  --set windows.enabled=true
 ```
 
-- Development
-```
-kustomize build "github.com/rancher/local-path-provisioner/deploy?ref=master" | kubectl apply -f -
+### Plain kustomize
+
+```bash
+kubectl apply -k deploy/csi
 ```
 
-After installation, you should see something like the following:
-```
-$ kubectl -n local-path-storage get pod
-NAME                                     READY     STATUS    RESTARTS   AGE
-local-path-provisioner-d744ccf98-xfcbk   1/1       Running   0          7m
+The kustomize layer in `deploy/csi/` is what the e2e suite installs; the
+Helm chart above renders the same manifests with values knobs and a clean
+upgrade story.
+
+After installation:
+
+```bash
+kubectl -n local-path-storage get pod
+# lpp-local-path-csi-controller-...   3/3   Running
+# lpp-local-path-csi-node-...         2/2   Running   (one per Linux node)
 ```
 
-Check and follow the provisioner log using:
-```
-kubectl -n local-path-storage logs -f -l app=local-path-provisioner
+Controller logs:
+
+```bash
+kubectl -n local-path-storage logs -f -l app=lpp-local-path-csi-controller
 ```
 
 ## Usage
 
-Create a `hostPath` backend Persistent Volume and a pod uses it:
-```
-kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pvc/pvc.yaml
-kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
+Bind a PVC against the shipped `local-path-csi` StorageClass and mount it:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: lpp-pvc, namespace: default }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path-csi
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: lpp-pod, namespace: default }
+spec:
+  containers:
+    - name: c
+      image: busybox:1.36
+      command: [sh,-c,'echo hello > /data/x && sleep 600']
+      volumeMounts: [{ name: v, mountPath: /data }]
+  volumes:
+    - name: v
+      persistentVolumeClaim: { claimName: lpp-pvc }
 ```
 
-Or, use `kustomize` to deploy them.
-```
-kustomize build "github.com/rancher/local-path-provisioner/examples/pod?ref=master" | kubectl apply -f -
-```
-
-You should see the PV has been created:
-```
-$ kubectl get pv
-NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS    CLAIM                    STORAGECLASS   REASON    AGE
-pvc-bc3117d9-c6d3-11e8-b36d-7a42907dda78   2Gi        RWO            Delete           Bound     default/local-path-pvc   local-path               4s
-```
-
-The PVC has been bound:
-```
-$ kubectl get pvc
-NAME             STATUS    VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
-local-path-pvc   Bound     pvc-bc3117d9-c6d3-11e8-b36d-7a42907dda78   2Gi        RWO            local-path     16s
-```
-
-And the Pod started running:
-```
-$ kubectl get pod
-NAME          READY     STATUS    RESTARTS   AGE
-volume-test   1/1       Running   0          3s
-```
-
-Write something into the pod
-```
-kubectl exec volume-test -- sh -c "echo local-path-test > /data/test"
-```
-
-Now delete the pod using
-```
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
-```
-
-After confirm that the pod is gone, recreated the pod using
-```
-kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
-```
-
-Check the volume content:
-```
-$ kubectl exec volume-test -- sh -c "cat /data/test"
-local-path-test
-```
-
-Delete the pod and pvc
-```
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pvc/pvc.yaml
-```
-
-Or, use `kustomize` to delete them.
-```
-kustomize build "github.com/rancher/local-path-provisioner/examples/pod?ref=master" | kubectl delete -f -
-```
-
-The volume content stored on the node will be automatically cleaned up. You can check the log of `local-path-provisioner-xxx` for details.
-
-Now you've verified that the provisioner works as expected.
+`kubectl exec lpp-pod -- cat /data/x` returns `hello`. Delete the pod, the
+volume content persists on the node; delete the PVC, the helper pod
+removes the directory (and any quota state). End-to-end verified in
+[`test/csi_test.go`](test/csi_test.go).
 
 ## Configuration
 
@@ -220,15 +217,11 @@ In addition `volumeBindingMode: Immediate` can be used in  StorageClass definiti
 
 Please note that `nodePathMap`, `sharedFileSystemPath`, and `storageClassConfigs` are mutually exclusive. If `sharedFileSystemPath` or `storageClassConfigs` are used, then `nodePathMap` must be set to `[]`.
 
-The `setupCommand` and `teardownCommand` allow you to specify the path to binary files in helperPod that will be called when creating or deleting pvc respectively. This can be useful if you need to use distroless images for security reasons. See the examples/distroless directory for an example. A binary file can take the following parameters:
-| Parameter | Description |
-| -------------------- | ----------- |
-| -p | Volume directory that should be created or removed. | -m | -p | Volume directory that should be created or removed. |
-| -m | The PersistentVolume mode (`Block` or `Filesystem`). | -m | The PersistentVolume mode (`Block` or `Filesystem`). |
-| -s | Requested volume size in bytes. | -s | Requested volume size in bytes. |
-| -a | Action type. Can be `create` or `delete` | -a | -a | Action type.
-
-The `setupCommand` and `teardownCommand` have higher priority than the `setup` and `teardown` scripts from the ConfigMap.  
+The full helper-pod command contract — every action (`create`, `delete`,
+`resize`, `snapshot`, `delete-snapshot`, `restore`, `check-usage`), the
+env vars, the `-p / -s / -m / -a` argv shape, stdout conventions, and the
+four-level override matrix (per-StorageClass → per-OS → global → built-in
+default) — lives in [`docs/hook-scripts.md`](docs/hook-scripts.md).
 
 ##### Rules
 The configuration must obey following rules:
@@ -305,7 +298,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: ssd-local-path
-provisioner: rancher.io/local-path
+provisioner: local-path.appmana.io
 parameters:
   nodePath: /data/ssd
   pathPattern: "{{ .PVC.Namespace }}/{{ .PVC.Name }}/"
@@ -326,7 +319,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: local-path-stable
-provisioner: rancher.io/local-path
+provisioner: local-path.appmana.io
 parameters:
   nodeAffinityKey: my.domain/stable-node-id
 volumeBindingMode: WaitForFirstConsumer
@@ -341,38 +334,23 @@ If the parameter is not specified, the default `kubernetes.io/hostname` behavior
 
 ## Uninstall
 
-Before uninstallation, make sure the PVs created by the provisioner have already been deleted. Use `kubectl get pv` and make sure no PV with StorageClass `local-path`.
+Before uninstallation, delete every PV created by the driver
+(`kubectl get pv` and check that no PV references the StorageClass).
+Then:
 
-To uninstall, execute:
-
-- Stable
-```
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.35/deploy/local-path-storage.yaml
-```
-
-- Development
-```
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+```bash
+helm uninstall lpp -n local-path-storage
 ```
 
-## Debug
-> it providers a out-of-cluster debug env for developers
-### debug
-```Bash
-git clone https://github.com/rancher/local-path-provisioner.git
-cd local-path-provisioner
-go build
-kubectl apply -f debug/config.yaml
-./local-path-provisioner --debug start --service-account-name=default
+or with kustomize:
+
+```bash
+kubectl delete -k deploy/csi
 ```
 
-### example
-[Usage](#usage)
-
-### clear
-```
-kubectl delete -f debug/config.yaml
-```
+`helm uninstall` removes the CSIDriver, ClusterRoles, RBAC bindings, the
+StorageClass, the namespace's resources, and (when `snapshots.enabled=true`)
+the VolumeSnapshotClass. Verified clean on the kind e2e cluster.
 
 ## Further docs
 

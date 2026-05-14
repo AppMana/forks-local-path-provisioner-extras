@@ -25,9 +25,7 @@ const (
 	envVolQuotaType = "VOL_QUOTA_TYPE"
 	envSnapDir      = "SNAP_DIR"
 
-	helperScriptDir     = "/script"
-	helperDataVolName   = "data"
-	helperScriptVolName = "script"
+	helperDataVolName = "data"
 
 	defaultCmdTimeoutSeconds = 120
 

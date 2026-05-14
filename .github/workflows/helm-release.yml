@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - appmana-extras
     tags:
       - v*
 
@@ -13,9 +14,9 @@ permissions:
 
 env:
   HELM_REGISTRY: ghcr.io
-  CHART_DIR: deploy/chart/local-path-provisioner
+  CHART_DIR: deploy/chart/local-path-csi
 
-jobs:  
+jobs:
   build_push_helm_chart:
     name: Build and Push Chart
     runs-on: ubuntu-latest
@@ -26,8 +27,9 @@ jobs:
       - name: Set Chart Tag
         id: set_tag
         run: |
-          if [[ "${GITHUB_REF}" == "refs/heads/master" ]]; then
-            echo "chart_tag=0.0.0-master" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/heads/* ]]; then
+            branch="${GITHUB_REF#refs/heads/}"
+            echo "chart_tag=0.0.0-${branch}" >> "$GITHUB_OUTPUT"
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             version="${GITHUB_REF#refs/tags/v}"
             echo "chart_tag=${version}" >> "$GITHUB_OUTPUT"

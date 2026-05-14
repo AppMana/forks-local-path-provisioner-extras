@@ -566,36 +566,11 @@ func (p *Provisioner) runHelperPodReal(ctx context.Context, a HelperAction) (err
 			HostPath: &v1.HostPathVolumeSource{Path: parentDir, Type: &hostPathType},
 		},
 	}}
-
-	// Configmap-script fallback only applies to Linux helper pods. On
-	// Windows, scripts ship with the helper image (HostProcess containers
-	// access them via $env:CONTAINER_SANDBOX_MOUNT_POINT or the in-image
-	// absolute path); the controller's command picker handles them.
-	keyToPathItems := []v1.KeyToPath{}
-	if osType != OSWindows {
-		if p.config.SetupCommand == "" {
-			keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "setup", Path: "setup"})
-		}
-		if p.config.TeardownCommand == "" {
-			keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "teardown", Path: "teardown"})
-		}
-		if p.config.ResizeCommand == "" {
-			keyToPathItems = append(keyToPathItems, v1.KeyToPath{Key: "resize", Path: "resize"})
-		}
-	}
-	if len(keyToPathItems) > 0 {
-		lpvVolumes = append(lpvVolumes, v1.Volume{
-			Name: helperScriptVolName,
-			VolumeSource: v1.VolumeSource{
-				ConfigMap: &v1.ConfigMapVolumeSource{
-					LocalObjectReference: v1.LocalObjectReference{Name: p.configMapName},
-					Items:                keyToPathItems,
-				},
-			},
-		})
-		scriptMount := addVolumeMount(&helperPod.Spec.Containers[0].VolumeMounts, helperScriptVolName, helperScriptDir)
-		scriptMount.MountPath = helperScriptDir
-	}
+	// Helper scripts ship inside the helper image (Linux: /usr/local/sbin,
+	// Windows: C:\opt\local-path-csi-scripts). The upstream sig-storage-lib
+	// flavor mounted three ConfigMap keys as a script volume; the CSI fork
+	// dropped that approach because the per-OS defaults plus the
+	// command-overrides matrix cover the same ground without an extra mount.
 	dataMount := addVolumeMount(&helperPod.Spec.Containers[0].VolumeMounts, helperDataVolName, parentDir)
 	parentDir = strings.TrimSuffix(dataMount.MountPath, string(filepath.Separator))
 	volumeDir = strings.TrimSuffix(volumeDir, string(filepath.Separator))

@@ -406,7 +406,7 @@ No scheduler extender. Wiring:
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
-metadata: { name: local-path.appmana.io }
+metadata: { name: local-path.appmana.com }
 spec:
   attachRequired: false
   podInfoOnMount: true
@@ -416,7 +416,7 @@ spec:
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata: { name: local-path-csi }
-provisioner: local-path.appmana.io
+provisioner: local-path.appmana.com
 volumeBindingMode: WaitForFirstConsumer    # ← required for topology-aware scheduling
 allowVolumeExpansion: true
 parameters:
@@ -445,7 +445,7 @@ Kube-scheduler's `VolumeBinding` plugin filters out nodes with insufficient capa
 
 ## 7. Implementation notes (decided)
 
-- **Driver name**: `local-path.appmana.io`.
+- **Driver name**: `local-path.appmana.com`.
 - **Controller binary base image**: `gcr.io/distroless/static:nonroot` (kubernetes-csi convention).
 - **Windows helper image base**: `mcr.microsoft.com/windows/servercore:ltsc2022`. Size (~5GB) accepted.
 - **CSIStorageCapacity poll cadence**: 30s, configurable via csi-provisioner sidecar `--capacity-poll-interval`.

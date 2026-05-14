@@ -160,7 +160,7 @@ the host's kind cluster.
 - **HostProcess CSI plugin registration** — the Windows DaemonSet uses
   HostProcess containers (Kubernetes ≥ 1.23). The harness validates the
   full kubelet↔plugin path; if the plugin's UDS at
-  `C:\var\lib\kubelet\plugins\local-path.appmana.io\csi.sock` doesn't
+  `C:\var\lib\kubelet\plugins\local-path.appmana.com\csi.sock` doesn't
   register, the node logs will show
   `node-driver-registrar` errors visible in `kubectl logs`.
 

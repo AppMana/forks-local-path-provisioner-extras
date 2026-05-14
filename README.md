@@ -298,7 +298,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: ssd-local-path
-provisioner: local-path.appmana.io
+provisioner: local-path.appmana.com
 parameters:
   nodePath: /data/ssd
   pathPattern: "{{ .PVC.Namespace }}/{{ .PVC.Name }}/"
@@ -319,7 +319,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: local-path-stable
-provisioner: local-path.appmana.io
+provisioner: local-path.appmana.com
 parameters:
   nodeAffinityKey: my.domain/stable-node-id
 volumeBindingMode: WaitForFirstConsumer

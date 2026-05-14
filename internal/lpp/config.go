@@ -57,15 +57,7 @@ func CanonicalizeConfig(data *ConfigData) (*Config, error) {
 	cfg.ResizeCommand = data.ResizeCommand
 	cfg.SnapshotCommand = data.SnapshotCommand
 	cfg.RestoreCommand = data.RestoreCommand
-	if data.Windows != nil {
-		cfg.Windows = &WindowsConfig{
-			SetupCommand:    data.Windows.SetupCommand,
-			TeardownCommand: data.Windows.TeardownCommand,
-			ResizeCommand:   data.Windows.ResizeCommand,
-			SnapshotCommand: data.Windows.SnapshotCommand,
-			RestoreCommand:  data.Windows.RestoreCommand,
-		}
-	}
+	cfg.Windows = data.Windows
 	if data.CmdTimeoutSeconds > 0 {
 		cfg.CmdTimeoutSeconds = data.CmdTimeoutSeconds
 	} else {
@@ -93,15 +85,7 @@ func canonicalizeStorageClassConfig(data *StorageClassConfigData) (cfg *StorageC
 	cfg.ResizeCommand = splitCmdString(data.ResizeCommand)
 	cfg.SnapshotCommand = splitCmdString(data.SnapshotCommand)
 	cfg.RestoreCommand = splitCmdString(data.RestoreCommand)
-	if data.Windows != nil {
-		cfg.Windows = &WindowsConfig{
-			SetupCommand:    data.Windows.SetupCommand,
-			TeardownCommand: data.Windows.TeardownCommand,
-			ResizeCommand:   data.Windows.ResizeCommand,
-			SnapshotCommand: data.Windows.SnapshotCommand,
-			RestoreCommand:  data.Windows.RestoreCommand,
-		}
-	}
+	cfg.Windows = data.Windows
 
 	if data.MinSize != "" {
 		q, err := resource.ParseQuantity(data.MinSize)

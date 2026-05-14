@@ -43,8 +43,8 @@ spec:
           command:
             - "$env:CONTAINER_SANDBOX_MOUNT_POINT/csi-node-driver-registrar.exe"
           args:
-            - --csi-address=unix://C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.io\\csi.sock
-            - --kubelet-registration-path=C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.io\\csi.sock
+            - --csi-address=unix://C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.com\\csi.sock
+            - --kubelet-registration-path=C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.com\\csi.sock
             - --plugin-registration-path=C:\\var\\lib\\kubelet\\plugins_registry
             - --v=2
           env:
@@ -59,7 +59,7 @@ spec:
             - "$env:CONTAINER_SANDBOX_MOUNT_POINT/local-path-csi.exe"
           args:
             - --mode=node
-            - --csi-endpoint=unix://C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.io\\csi.sock
+            - --csi-endpoint=unix://C:\\var\\lib\\kubelet\\plugins\\local-path.appmana.com\\csi.sock
             - --namespace=$(POD_NAMESPACE)
           env:
             - name: NODE_ID

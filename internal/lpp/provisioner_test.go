@@ -164,7 +164,7 @@ func TestProvisioner_InitCapacityTracker_FromExistingPVs(t *testing.T) {
 			Capacity: v1.ResourceList{v1.ResourceStorage: resource.MustParse("1Gi")},
 			PersistentVolumeSource: v1.PersistentVolumeSource{
 				CSI: &v1.CSIPersistentVolumeSource{
-					Driver: "local-path.appmana.io",
+					Driver: "local-path.appmana.com",
 					VolumeAttributes: map[string]string{
 						"node": "n",
 						"path": "/data/pv-existing_default_existing",

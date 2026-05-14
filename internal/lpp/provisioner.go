@@ -176,51 +176,79 @@ var (
 	}
 )
 
-// scActionCmd returns the per-OS command override on a StorageClassConfig for
-// a given action, or nil if no override is set. Used as the first step in
-// commandFor's precedence chain.
-func scActionCmd(sc *StorageClassConfig, action ActionType, osType string) []string {
-	if sc == nil {
-		return nil
-	}
-	if osType == OSWindows {
-		if sc.Windows == nil {
-			return nil
-		}
-		switch action {
-		case ActionTypeCreate:
-			return sc.Windows.SetupCommand
-		case ActionTypeDelete:
-			return sc.Windows.TeardownCommand
-		case ActionTypeResize:
-			return sc.Windows.ResizeCommand
-		case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
-			return sc.Windows.SnapshotCommand
-		case ActionTypeRestore:
-			return sc.Windows.RestoreCommand
-		}
+// cmdFor returns the action's command from a WindowsConfig (per-OS override
+// block), or nil if not set. Snapshot and delete-snapshot share a slot.
+func (w *WindowsConfig) cmdFor(action ActionType) []string {
+	if w == nil {
 		return nil
 	}
 	switch action {
 	case ActionTypeCreate:
-		return sc.SetupCommand
+		return w.SetupCommand
 	case ActionTypeDelete:
-		return sc.TeardownCommand
+		return w.TeardownCommand
 	case ActionTypeResize:
-		return sc.ResizeCommand
+		return w.ResizeCommand
 	case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
-		return sc.SnapshotCommand
+		return w.SnapshotCommand
 	case ActionTypeRestore:
-		return sc.RestoreCommand
+		return w.RestoreCommand
 	}
 	return nil
 }
 
+// cmdFor returns the action's Linux command from a StorageClassConfig, or
+// nil if not set.
+func (s *StorageClassConfig) cmdFor(action ActionType) []string {
+	if s == nil {
+		return nil
+	}
+	switch action {
+	case ActionTypeCreate:
+		return s.SetupCommand
+	case ActionTypeDelete:
+		return s.TeardownCommand
+	case ActionTypeResize:
+		return s.ResizeCommand
+	case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
+		return s.SnapshotCommand
+	case ActionTypeRestore:
+		return s.RestoreCommand
+	}
+	return nil
+}
+
+// globalLinuxCmd returns the action's global Linux command from a Config,
+// or nil if not set. The legacy contract here is "single command, no args"
+// so a non-empty string is wrapped in []string before returning.
+func (c *Config) globalLinuxCmd(action ActionType) []string {
+	if c == nil {
+		return nil
+	}
+	var s string
+	switch action {
+	case ActionTypeCreate:
+		s = c.SetupCommand
+	case ActionTypeDelete:
+		s = c.TeardownCommand
+	case ActionTypeResize:
+		s = c.ResizeCommand
+	case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
+		s = c.SnapshotCommand
+	case ActionTypeRestore:
+		s = c.RestoreCommand
+	}
+	if s == "" {
+		return nil
+	}
+	return []string{s}
+}
+
 // commandFor returns the command to invoke for (action, osType, sc). The
 // precedence chain is:
-//   1. per-StorageClass override (sc.<cmd> / sc.Windows.<cmd>)
-//   2. per-OS override on the global config (config.Windows.<cmd>)
-//   3. global override (config.<cmd>)
+//   1. per-StorageClass override for the resolved OS
+//   2. per-OS override on the global config
+//   3. global Linux command on the global config (Linux only)
 //   4. built-in default for the resolved OS
 //
 // sc may be nil; that just skips step 1. The caller holds no locks — this
@@ -228,61 +256,27 @@ func scActionCmd(sc *StorageClassConfig, action ActionType, osType string) []str
 func (p *Provisioner) commandFor(action ActionType, osType string, sc *StorageClassConfig) []string {
 	p.configMutex.RLock()
 	defer p.configMutex.RUnlock()
-	if cmd := scActionCmd(sc, action, osType); len(cmd) > 0 {
-		return append([]string(nil), cmd...)
-	}
+
+	var candidates [][]string
 	if osType == OSWindows {
-		if p.config != nil && p.config.Windows != nil {
-			switch action {
-			case ActionTypeCreate:
-				if len(p.config.Windows.SetupCommand) > 0 {
-					return append([]string(nil), p.config.Windows.SetupCommand...)
-				}
-			case ActionTypeDelete:
-				if len(p.config.Windows.TeardownCommand) > 0 {
-					return append([]string(nil), p.config.Windows.TeardownCommand...)
-				}
-			case ActionTypeResize:
-				if len(p.config.Windows.ResizeCommand) > 0 {
-					return append([]string(nil), p.config.Windows.ResizeCommand...)
-				}
-			case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
-				if len(p.config.Windows.SnapshotCommand) > 0 {
-					return append([]string(nil), p.config.Windows.SnapshotCommand...)
-				}
-			case ActionTypeRestore:
-				if len(p.config.Windows.RestoreCommand) > 0 {
-					return append([]string(nil), p.config.Windows.RestoreCommand...)
-				}
-			}
+		if sc != nil {
+			candidates = append(candidates, sc.Windows.cmdFor(action))
 		}
-		return append([]string(nil), defaultWindowsCommands[action]...)
+		if p.config != nil {
+			candidates = append(candidates, p.config.Windows.cmdFor(action))
+		}
+		candidates = append(candidates, defaultWindowsCommands[action])
+	} else {
+		candidates = append(candidates, sc.cmdFor(action))
+		candidates = append(candidates, p.config.globalLinuxCmd(action))
+		candidates = append(candidates, defaultLinuxCommands[action])
 	}
-	if p.config != nil {
-		switch action {
-		case ActionTypeCreate:
-			if p.config.SetupCommand != "" {
-				return []string{p.config.SetupCommand}
-			}
-		case ActionTypeDelete:
-			if p.config.TeardownCommand != "" {
-				return []string{p.config.TeardownCommand}
-			}
-		case ActionTypeResize:
-			if p.config.ResizeCommand != "" {
-				return []string{p.config.ResizeCommand}
-			}
-		case ActionTypeSnapshot, ActionTypeDeleteSnapshot:
-			if p.config.SnapshotCommand != "" {
-				return []string{p.config.SnapshotCommand}
-			}
-		case ActionTypeRestore:
-			if p.config.RestoreCommand != "" {
-				return []string{p.config.RestoreCommand}
-			}
+	for _, c := range candidates {
+		if len(c) > 0 {
+			return append([]string(nil), c...)
 		}
 	}
-	return append([]string(nil), defaultLinuxCommands[action]...)
+	return nil
 }
 
 // SetupCommand / TeardownCommand / ResizeCommand / SnapshotCommand /

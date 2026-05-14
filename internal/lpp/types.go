@@ -81,12 +81,12 @@ type StorageClassConfigData struct {
 	// global overrides and then to the per-OS defaults baked into the
 	// controller. The Windows sub-block has the same precedence semantics
 	// per action.
-	SetupCommand    string             `json:"setupCommand,omitempty"`
-	TeardownCommand string             `json:"teardownCommand,omitempty"`
-	ResizeCommand   string             `json:"resizeCommand,omitempty"`
-	SnapshotCommand string             `json:"snapshotCommand,omitempty"`
-	RestoreCommand  string             `json:"restoreCommand,omitempty"`
-	Windows         *WindowsConfigData `json:"windows,omitempty"`
+	SetupCommand    string         `json:"setupCommand,omitempty"`
+	TeardownCommand string         `json:"teardownCommand,omitempty"`
+	ResizeCommand   string         `json:"resizeCommand,omitempty"`
+	SnapshotCommand string         `json:"snapshotCommand,omitempty"`
+	RestoreCommand  string         `json:"restoreCommand,omitempty"`
+	Windows         *WindowsConfig `json:"windows,omitempty"`
 }
 
 type ConfigData struct {
@@ -101,14 +101,20 @@ type ConfigData struct {
 	// string (the whole argv as a shell line, split on whitespace) or an
 	// array. When nil or empty, the controller falls back to the built-in
 	// Windows defaults baked into the helper image.
-	Windows *WindowsConfigData `json:"windows,omitempty"`
+	Windows *WindowsConfig `json:"windows,omitempty"`
 	StorageClassConfigData
 	StorageClassConfigs map[string]StorageClassConfigData `json:"storageClassConfigs"`
 }
 
-// WindowsConfigData mirrors the top-level command paths for Windows nodes.
-// Empty values inherit the controller's per-OS defaults.
-type WindowsConfigData struct {
+// WindowsConfig is the Windows sub-block of overrides used when the helper
+// pod runs on a node labelled kubernetes.io/os=windows. Each field accepts
+// either a single argv string (whitespace-tokenized via StringOrArray) or
+// an array of argv tokens. Empty values inherit the per-OS defaults baked
+// into the controller. Used both at top-level (ConfigData / Config) and
+// per-StorageClass (StorageClassConfigData / StorageClassConfig); the
+// post-canonicalize form is the same struct because StringOrArray IS a
+// []string at runtime.
+type WindowsConfig struct {
 	SetupCommand    StringOrArray `json:"setupCommand,omitempty"`
 	TeardownCommand StringOrArray `json:"teardownCommand,omitempty"`
 	ResizeCommand   StringOrArray `json:"resizeCommand,omitempty"`
@@ -179,12 +185,3 @@ type Config struct {
 	StorageClassConfigs map[string]StorageClassConfig
 }
 
-// WindowsConfig is the canonicalized per-OS command overrides. Empty
-// fields fall back to the per-OS defaults baked into the controller.
-type WindowsConfig struct {
-	SetupCommand    []string
-	TeardownCommand []string
-	ResizeCommand   []string
-	SnapshotCommand []string
-	RestoreCommand  []string
-}

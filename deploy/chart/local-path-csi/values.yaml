@@ -3,7 +3,7 @@
 # Driver name. Must match CSIDriver.metadata.name. Changing this on an
 # upgrade is NOT supported — existing PVs reference this string and will
 # fail to mount under a new name. Treat as immutable post-install.
-driverName: local-path.appmana.io
+driverName: local-path.appmana.com
 
 # Namespace into which the controller Deployment + node DaemonSet are
 # installed. Helm's release namespace is the default; override only when

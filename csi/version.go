@@ -1,7 +1,7 @@
 package csi
 
 const (
-	DriverName    = "local-path.appmana.io"
+	DriverName    = "local-path.appmana.com"
 	DriverVersion = "0.1.0"
 
 	TopologyKeyNode = "kubernetes.io/hostname"
